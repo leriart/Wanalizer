@@ -5,23 +5,38 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wanalyzer"
 version = "3.0.0"
-description = "Wanalizer - Intelligent wallpaper organizer with 4 analysis modes: Low-Level CV, CLIP, CLIP+LowLevel fusion, and Ollama vision LLMs."
+description = "Intelligent wallpaper organizer with 4 analysis modes: Low-Level CV, CLIP, CLIP+LowLevel fusion, and Ollama vision LLMs."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
     {name = "Wanalizer Contributors"},
 ]
-keywords = ["wallpaper", "organizer", "computer-vision", "clip", "ollama", "image-classification", "wanalyzer"]
+keywords = [
+    "wallpaper",
+    "organizer",
+    "computer-vision",
+    "clip",
+    "ollama",
+    "image-classification",
+    "pyside6",
+    "wanalyzer",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: X11 Applications :: Qt",
+    "Environment :: Win32 (MS Windows)",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Graphics",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
@@ -34,9 +49,37 @@ dependencies = [
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.6.0"]
-cv = ["opencv-python-headless>=4.8.0", "imagehash>=4.3.0", "scikit-learn>=1.3.0"]
-clip = ["torch>=2.0.0", "torchvision>=0.15.0", "clip @ git+https://github.com/openai/CLIP.git"]
-all = ["PySide6>=6.6.0", "opencv-python-headless>=4.8.0", "imagehash>=4.3.0", "scikit-learn>=1.3.0"]
+cv = [
+    "opencv-python-headless>=4.8.0",
+    "imagehash>=4.3.0",
+    "scikit-learn>=1.3.0",
+]
+clip = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "clip @ git+https://github.com/openai/CLIP.git",
+]
+formats = [
+    "pillow-avif-plugin>=1.4.0",
+    "pillow-heif>=0.16.0",
+    "pillow-jxl-plugin>=1.3.0",
+    "psd-tools>=1.10.0",
+    "OpenEXR>=3.2.0",
+    "cairosvg>=2.7.0",
+    "pypdfium2>=4.0.0",
+    "rawpy>=0.18.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4.0",
+]
+all = [
+    "PySide6>=6.6.0",
+    "opencv-python-headless>=4.8.0",
+    "imagehash>=4.3.0",
+    "scikit-learn>=1.3.0",
+]
 
 [project.scripts]
 wanalyzer = "wallpaper_analyzer.cli:main"
@@ -45,6 +88,26 @@ wanalyzer-gui = "wallpaper_analyzer.gui:main"
 [project.urls]
 "Source" = "https://github.com/leo/Wanalizer"
 "Issues" = "https://github.com/leo/Wanalizer/issues"
+"Changelog" = "https://github.com/leo/Wanalizer/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["wallpaper_analyzer*"]
+
+[tool.setuptools.package-data]
+wallpaper_analyzer = ["py.typed", "data/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",  # line length (handled by formatter)
+    "B008",  # function-call-in-default-argument (common in Qt signal APIs)
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"

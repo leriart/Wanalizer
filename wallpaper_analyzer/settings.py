@@ -79,15 +79,39 @@ def resolve_hash_cache_path(settings=None):
 
 
 def load_settings():
+    """Load settings from disk merged with environment overrides.
+
+    Order of precedence (highest first):
+      1. Environment variables (`WANALIZER_*`, plus a few documented
+         shortcuts like `OLLAMA_URL`).
+      2. `.wallpaper_analyzer.json` in the project directory.
+      3. Built-in defaults.
+    """
     defaults = SETTINGS_DEFAULTS.copy()
-    if not os.path.exists(CONFIG_PATH):
-        return defaults
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-    except Exception:
-        return defaults
-    defaults.update(data)
+
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            if isinstance(data, dict):
+                defaults.update(data)
+        except Exception:
+            pass
+
+    env_overrides = {
+        "organize_mode":    os.environ.get("WANALIZER_MODE"),
+        "dest_dir":         os.environ.get("WANALIZER_DEST"),
+        "ollama_url":       os.environ.get("OLLAMA_URL")
+                            or os.environ.get("WANALIZER_OLLAMA_URL"),
+        "ollama_model":     os.environ.get("OLLAMA_MODEL")
+                            or os.environ.get("WANALIZER_OLLAMA_MODEL"),
+        "clip_model":       os.environ.get("WANALIZER_CLIP_MODEL"),
+        "theme":            os.environ.get("WANALIZER_THEME"),
+    }
+    for key, value in env_overrides.items():
+        if value:
+            defaults[key] = value
+
     return defaults
 
 

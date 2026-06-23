@@ -1,16 +1,12 @@
 """Main organization pipeline."""
 import os
-import sys
 import shutil
-import json
 import tempfile
-import concurrent.futures
 import time
 from typing import Dict, List, Optional, Set, Tuple
 from PIL import Image
 
 from .settings import load_settings, save_settings, resolve_dest_dir, PROJECT_DIR
-from . import formats as _formats_mod
 from .parallel import (
     cpu_count,
     estimate_eta,
@@ -20,19 +16,19 @@ from .parallel import (
 )
 from .formats import (
     STATIC_EXTENSIONS, ANIMATED_EXTENSIONS, PLUGIN_EXTENSIONS,
+    WALLPAPERS_DIR,
     supported_image_files,
 )
 from . import categories as c
 from . import tags as t
 from .duplicates import (
     load_hash_cache, save_hash_cache,
-    find_duplicate_groups, move_duplicates,
+    find_duplicate_groups,
     scan_and_hash, find_md5_duplicate_groups,
 )
-from .profile import get_image_profile
 from .quality import laplacian_variance
 from .classify import classify
-from .hashing import hamming_distance
+from .analyzers import get_analyzer as _analyzer_factory
 
 LOW_QUALITY_FOLDER = "Low-Quality"
 NSFW_FOLDER = "NSFW"
@@ -45,19 +41,12 @@ SKIP_DIRS: Set[str] = {".git", "__pycache__", "Duplicates",
 
 
 def get_analyzer(mode: str, settings: dict):
-    """Factory: returns the appropriate analyzer for the given mode."""
-    if mode == "clip":
-        from .clip_client import CLIPAnalyzer
-        return CLIPAnalyzer(settings)
-    elif mode == "fusion":
-        from .analyzers.fusion_mode import FusionAnalyzer
-        return FusionAnalyzer(settings)
-    elif mode == "ollama":
-        from .ollama_client import OllamaAnalyzer
-        return OllamaAnalyzer(settings)
-    else:
-        from .analyzers.lowlevel_mode import LowLevelAnalyzer
-        return LowLevelAnalyzer(settings)
+    """Factory: returns the appropriate analyzer for the given mode.
+
+    Thin re-export of `wallpaper_analyzer.analyzers.get_analyzer` kept
+    here for backwards compatibility with existing callers (and tests).
+    """
+    return _analyzer_factory(mode, settings)
 
 
 def _extract_frame_if_video(path: str, max_size: int = 1024) -> Tuple[str, bool]:
@@ -225,8 +214,8 @@ def flatten_all(include_category_dirs: bool = False):
         skip_dirs |= set(c.CATEGORIES)
     moved = 0
     collisions = 0
-    for dirpath, dirnames, filenames in os.walk(_formats_mod.WALLPAPERS_DIR):
-        rel = os.path.relpath(dirpath, _formats_mod.WALLPAPERS_DIR)
+    for dirpath, dirnames, filenames in os.walk(WALLPAPERS_DIR):
+        rel = os.path.relpath(dirpath, WALLPAPERS_DIR)
         if rel == ".": continue
         parts = rel.split(os.sep)
         if any(p.startswith(".") or p in skip_dirs for p in parts):
@@ -236,15 +225,15 @@ def flatten_all(include_category_dirs: bool = False):
             if ext not in (STATIC_EXTENSIONS | ANIMATED_EXTENSIONS | PLUGIN_EXTENSIONS):
                 continue
             src = os.path.join(dirpath, fname)
-            dst = os.path.join(_formats_mod.WALLPAPERS_DIR, fname)
+            dst = os.path.join(WALLPAPERS_DIR, fname)
             if os.path.exists(dst):
                 parent_name = os.path.basename(os.path.dirname(src))
                 name_part, ext_part = os.path.splitext(fname)
                 candidate = f"{parent_name}_{name_part}{ext_part}"
-                if os.path.exists(os.path.join(_formats_mod.WALLPAPERS_DIR, candidate)):
+                if os.path.exists(os.path.join(WALLPAPERS_DIR, candidate)):
                     name2, ext2 = os.path.splitext(candidate)
                     candidate = f"{name2}_1{ext2}"
-                dst = os.path.join(_formats_mod.WALLPAPERS_DIR, candidate)
+                dst = os.path.join(WALLPAPERS_DIR, candidate)
                 collisions += 1
             shutil.move(src, dst)
             moved += 1
@@ -427,7 +416,7 @@ def organize(mode: str = "lowlevel",
 
     analyzer = get_analyzer(mode, s)
 
-    files = supported_image_files(_formats_mod.WALLPAPERS_DIR, include_animations=True)
+    files = supported_image_files(WALLPAPERS_DIR, include_animations=True)
     print(f"Mode: {mode.upper()}", flush=True)
     print(f"Destination: {dest_dir}", flush=True)
     print(f"Source files: {len(files)}", flush=True)
@@ -454,8 +443,8 @@ def organize(mode: str = "lowlevel",
                     if os.path.splitext(fn)[1].lower() in (STATIC_EXTENSIONS | ANIMATED_EXTENSIONS):
                         all_files.append(os.path.join(d, fn))
         # Scan source (files to be organized)
-        for d, _, fns in os.walk(_formats_mod.WALLPAPERS_DIR):
-            rel = os.path.relpath(d, _formats_mod.WALLPAPERS_DIR)
+        for d, _, fns in os.walk(WALLPAPERS_DIR):
+            rel = os.path.relpath(d, WALLPAPERS_DIR)
             parts = rel.split(os.sep)
             if rel != "." and any(p.startswith(".") or p in SKIP_DIRS for p in parts):
                 continue
@@ -523,7 +512,7 @@ def organize(mode: str = "lowlevel",
         md5_groups = find_md5_duplicate_groups(all_files, md5s)
         if md5_groups:
             dest_abs = os.path.abspath(dest_dir)
-            source_abs = os.path.abspath(_formats_mod.WALLPAPERS_DIR)
+            source_abs = os.path.abspath(WALLPAPERS_DIR)
             dest_set = {
                 os.path.abspath(f) for f in all_files
                 if os.path.abspath(f).startswith(dest_abs)
@@ -575,7 +564,7 @@ def organize(mode: str = "lowlevel",
                     moved = _move_to_dupes(
                         md5_to_move,
                         dest_dir if os.path.isdir(dest_dir)
-                        else _formats_mod.WALLPAPERS_DIR,
+                        else WALLPAPERS_DIR,
                     )
                     print(
                         f"[DEDUPE-MD5] Moved {moved} exact duplicate(s) "
@@ -584,7 +573,7 @@ def organize(mode: str = "lowlevel",
                         flush=True,
                     )
                     files = supported_image_files(
-                        _formats_mod.WALLPAPERS_DIR, include_animations=True,
+                        WALLPAPERS_DIR, include_animations=True,
                     )
                     # Rebuild all_files to reflect the removed duplicates
                     # so the perceptual pass below doesn't waste work on them.
@@ -607,7 +596,7 @@ def organize(mode: str = "lowlevel",
         save_hash_cache(cache)
         # Separate: duplicates within destination vs cross-directory
         dest_abs = os.path.abspath(dest_dir)
-        source_abs = os.path.abspath(_formats_mod.WALLPAPERS_DIR)
+        source_abs = os.path.abspath(WALLPAPERS_DIR)
         dest_files = set(os.path.abspath(f) for f in all_files if os.path.abspath(f).startswith(dest_abs))
         source_files = set(os.path.abspath(f) for f in all_files if os.path.abspath(f).startswith(source_abs))
         to_move_to_dupes: List[str] = []
@@ -632,9 +621,9 @@ def organize(mode: str = "lowlevel",
                 print(f"[DRY] Would remove {len(to_move_to_dupes)} duplicate(s) from source.", flush=True)
             else:
                 from .duplicates import move_to_duplicates as _move_to_dupes
-                moved = _move_to_dupes(to_move_to_dupes, dest_dir if os.path.isdir(dest_dir) else _formats_mod.WALLPAPERS_DIR)
+                moved = _move_to_dupes(to_move_to_dupes, dest_dir if os.path.isdir(dest_dir) else WALLPAPERS_DIR)
                 print(f"[DEDUPE] Moved {moved} duplicate(s) to Duplicates/", flush=True)
-                files = supported_image_files(_formats_mod.WALLPAPERS_DIR, include_animations=True)
+                files = supported_image_files(WALLPAPERS_DIR, include_animations=True)
                 print(flush=True)
         else:
             print("[DEDUPE] No duplicates found", flush=True)
@@ -665,7 +654,7 @@ def organize(mode: str = "lowlevel",
 
     entries: List[Tuple[int, str, str]] = []
     for i, fname in enumerate(files, 1):
-        fpath = os.path.join(_formats_mod.WALLPAPERS_DIR, fname)
+        fpath = os.path.join(WALLPAPERS_DIR, fname)
         if not os.path.isfile(fpath):
             continue
         entries.append((i, fname, fpath))
@@ -825,7 +814,7 @@ def organize(mode: str = "lowlevel",
         tags_by_file = {}
         subject_by_file = {}
         for fname, cat, extra in classified:
-            src = os.path.join(_formats_mod.WALLPAPERS_DIR, fname)
+            src = os.path.join(WALLPAPERS_DIR, fname)
             if os.path.exists(src):
                 all_files.append(src)
                 cat_by_file[src] = cat
@@ -859,7 +848,7 @@ def organize(mode: str = "lowlevel",
 
     print("Moving files...")
     for fname, cat, _ in classified:
-        src = os.path.join(_formats_mod.WALLPAPERS_DIR, fname)
+        src = os.path.join(WALLPAPERS_DIR, fname)
         if not os.path.exists(src):
             continue
         dst_dir = os.path.join(dest_dir, cat)

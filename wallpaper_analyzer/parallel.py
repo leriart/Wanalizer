@@ -20,6 +20,7 @@ from __future__ import annotations
 import concurrent.futures
 import multiprocessing as mp
 import os
+import pickle
 import sys
 import threading
 import time
@@ -184,10 +185,6 @@ def _run_one(fn, item, on_progress, done, total):
     if on_progress is not None:
         on_progress(done, total, item, res)
     return res
-
-
-# Late import so the module can still be imported even if pickle is missing.
-import pickle  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

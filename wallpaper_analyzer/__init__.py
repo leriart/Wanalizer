@@ -31,5 +31,21 @@ Usage:
   wanalizer-gui           Launch the GUI after pip install
 """
 
-__version__ = "3.0.0"
+from __future__ import annotations
+
 __project__ = "Wanalizer"
+
+try:
+    # When installed via `pip install .` the metadata is provided by
+    # the package and we use it as the single source of truth.
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    try:
+        __version__ = _pkg_version("wanalyzer")
+    except PackageNotFoundError:
+        # Running from a source checkout without an installed dist.
+        __version__ = "3.0.0"
+except Exception:
+    __version__ = "3.0.0"
+
+__all__ = ["__project__", "__version__"]

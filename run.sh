@@ -231,9 +231,14 @@ case "${1:-}" in
     --version|-V)
         py="$(venv_python "$VENV_DIR")"
         if [ -z "$py" ]; then
-            system_python >/dev/null && py="$(system_python)" || py="python3"
+            if system_python >/dev/null; then
+                py="$(system_python)"
+            else
+                py="python3"
+            fi
         fi
-        say "Wanalizer v$(.venv/bin/python -c 'import wallpaper_analyzer; print(wallpaper_analyzer.__version__)' 2>/dev/null || echo 'unknown')"
+        ver="$("$py" -c 'import wallpaper_analyzer; print(wallpaper_analyzer.__version__)' 2>/dev/null || echo 'unknown')"
+        say "Wanalizer v${ver}"
         say "Launcher: $0"
         say "Project dir: $PROJECT_DIR"
         exit 0

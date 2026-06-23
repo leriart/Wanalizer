@@ -2,36 +2,73 @@
 __pycache__/
 *.py[cod]
 *.pyo
+*$py.class
 *.egg-info/
 *.egg
+.eggs/
 
 # Virtual environments
 .venv/
+.venv-t/
 venv/
 env/
+ENV/
 
-# Build
+# Build / distribution
 build/
 dist/
+develop-eggs/
+downloads/
+eggs/
+parts/
+sdist/
+wheels/
+pip-wheel-metadata/
 
-# IDE
+# Installer logs
+pip-log.txt
+*.pip-log
+
+# Test / coverage / type caches
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright_cache/
+
+# IDE / editor
 .vscode/
 .idea/
+*.iml
 *.swp
 *.swo
+*~
 .DS_Store
 Thumbs.db
+.project
+.classpath
+.settings/
 
-# Config file with user paths (security)
+# Local config file with user paths (security)
 .wallpaper_analyzer.json
 
 # Auto-generated hash caches inside destination folders
 *.wallpaper_analyzer_hashes.json
 
-# Temporary files
+# Temporary / report files
 report.json
 *.report.json
 
 # Qt settings
 .qsettings/
-/.python-t
+
+# Free-threaded Python runtime downloaded by run.sh
+/.python-t/
+
+# Local user library (override via --set-dest)
+/WP/

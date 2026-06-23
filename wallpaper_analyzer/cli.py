@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """CLI entry point for Wanalizer."""
 import os
-import sys
 import argparse
-import json
 
 from .settings import load_settings, save_settings, resolve_dest_dir, PROJECT_DIR
-from .categories import discover_categories, CATEGORIES
-from .formats import STATIC_EXTENSIONS, ANIMATED_EXTENSIONS, PLUGIN_EXTENSIONS
-from .organize import organize, flatten_all, get_analyzer
-from .duplicates import load_hash_cache, find_duplicate_groups, move_duplicates
-from .tags import load_tags, get_all_tags
+from .categories import discover_categories
+from .formats import STATIC_EXTENSIONS, ANIMATED_EXTENSIONS
+from .organize import organize, flatten_all
+from .duplicates import load_hash_cache, find_duplicate_groups
 from .parallel import cpu_count
 
 OPTIONAL_DEPS: dict = {
