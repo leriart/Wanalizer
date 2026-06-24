@@ -600,11 +600,15 @@ def _clip_tag_vocab() -> List[str]:
 
 
 def _clip_detect_tags(image_path: str, max_tags: int = 8,
-                     category: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
+                     category: Optional[str] = None,
+                     model: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
     """Use CLIP to rank the curated tag vocabulary by visual similarity.
 
     Returns the top-`max_tags` tags (highest CLIP cosine). Falls back to
     an empty list if CLIP is not installed / the model failed to load.
+
+    `model` overrides the configured CLIP model. If None, the model
+    stored in settings (or "ViT-B/32") is used.
 
     Memory-conscious: encodes the text vocabulary in batches so we
     don't allocate a multi-megabyte text-feature matrix in one go,
@@ -613,7 +617,7 @@ def _clip_detect_tags(image_path: str, max_tags: int = 8,
     """
     try:
         from .clip_client import get_engine
-        engine = get_engine()
+        engine = get_engine(model_name=model)
         if not engine.available:
             return [], None
         vocab = _clip_tag_vocab()
@@ -662,8 +666,12 @@ def _clip_detect_tags(image_path: str, max_tags: int = 8,
 
 
 def _ollama_detect_tags(image_path: str, max_tags: int = 8,
-                       category: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
+                       category: Optional[str] = None,
+                       model: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
     """Use a local Ollama vision model to describe and tag the image.
+
+    `model` overrides the configured Ollama model. If None, the model
+    stored in settings (or "llava:7b") is used.
 
     Closes the client after each call so the underlying HTTP session
     doesn't accumulate open connections across many files.
@@ -672,9 +680,10 @@ def _ollama_detect_tags(image_path: str, max_tags: int = 8,
         from . import settings as _settings
         from .ollama_client import OllamaClient
         cfg = _settings.load_settings()
+        chosen = model or cfg.get("ollama_model", "llava:7b")
         client = OllamaClient(
             base_url=cfg.get("ollama_url", "http://localhost:11434"),
-            model=cfg.get("ollama_model", "llava:7b"),
+            model=chosen,
             timeout=int(cfg.get("ollama_timeout", 60)),
         )
         try:
@@ -696,6 +705,7 @@ def ai_detect_tags(
     backend: str = "auto",
     category: Optional[str] = None,
     max_tags: int = 8,
+    model: Optional[str] = None,
     progress_cb=None,
 ) -> Tuple[List[str], Optional[str]]:
     """Detect descriptive tags using the requested AI backend.
@@ -710,6 +720,8 @@ def ai_detect_tags(
         category: optional category hint used by the heuristic fallback
             and surfaced in logs.
         max_tags: cap on the returned tag list.
+        model: optional explicit model name (overrides the configured
+            active model). ``None`` falls back to whatever's in settings.
         progress_cb: optional ``callable(stage, msg)`` for status updates.
 
     Returns:
@@ -729,18 +741,18 @@ def ai_detect_tags(
                 pass
 
     if backend == "ollama":
-        _emit("ollama", f"Querying Ollama for {os.path.basename(image_path)}")
-        tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags, category=category)
+        _emit("ollama", f"Querying Ollama ({model or 'configured'}) for {os.path.basename(image_path)}")
+        tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags,
+                                         category=category, model=model)
         if tags or subj:
-            # Always wrap with the deterministic fallback so the result
-            # is never empty — augments AI tags with colour/aspect/brightness.
             return _fallback_tags(image_path, tags, max_tags=max_tags), subj
         _emit("fallback", "Ollama returned no tags, using deterministic fallback")
         return _fallback_tags(image_path, [], max_tags=max_tags), None
 
     if backend == "clip":
-        _emit("clip", f"Scoring CLIP tag vocabulary for {os.path.basename(image_path)}")
-        tags, subj = _clip_detect_tags(image_path, max_tags=max_tags, category=category)
+        _emit("clip", f"Scoring CLIP ({model or 'configured'}) tag vocabulary for {os.path.basename(image_path)}")
+        tags, subj = _clip_detect_tags(image_path, max_tags=max_tags,
+                                      category=category, model=model)
         if tags or subj:
             return _fallback_tags(image_path, tags, max_tags=max_tags), subj
         _emit("fallback", "CLIP returned no tags, using deterministic fallback")
@@ -756,10 +768,12 @@ def ai_detect_tags(
 
     # auto: try Ollama → CLIP → heuristic → deterministic fallback.
     _emit("auto", f"Auto-detecting tags for {os.path.basename(image_path)}")
-    tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags, category=category)
+    tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags,
+                                     category=category, model=model)
     if tags or subj:
         return _fallback_tags(image_path, tags, max_tags=max_tags), subj
-    tags, subj = _clip_detect_tags(image_path, max_tags=max_tags, category=category)
+    tags, subj = _clip_detect_tags(image_path, max_tags=max_tags,
+                                  category=category, model=model)
     if tags or subj:
         return _fallback_tags(image_path, tags, max_tags=max_tags), subj
     _emit("fallback", "All AI backends returned no tags, using deterministic fallback")
@@ -779,6 +793,7 @@ def ai_compute_renames(
     pad: int = 3,
     start: int = 1,
     truncate_len: int = 32,
+    model: Optional[str] = None,
     progress_cb=None,
 ) -> List[Tuple[str, str]]:
     """Build rename pairs using AI-detected tags.
@@ -786,6 +801,9 @@ def ai_compute_renames(
     Like ``compute_renames`` but uses ``ai_detect_tags`` (CLIP / Ollama)
     for tag-based strategies. For non-tag strategies the result is
     identical to ``build_renames``.
+
+    `model` overrides the configured active model for both CLIP and
+    Ollama backends. Pass ``None`` to use whatever's in settings.
     """
     needs_tags = strategy in TAG_BASED_STRATEGIES
     tags_by_file: Dict[str, List[str]] = {}
@@ -795,7 +813,7 @@ def ai_compute_renames(
         for i, p in enumerate(files, 1):
             tags, subject = ai_detect_tags(
                 p, backend=backend, category=category, max_tags=max_tags,
-                progress_cb=progress_cb,
+                model=model, progress_cb=progress_cb,
             )
             tags_by_file[p] = tags
             subject_by_file[p] = subject

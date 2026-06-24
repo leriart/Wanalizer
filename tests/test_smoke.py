@@ -561,3 +561,77 @@ def test_build_renames_category_tags_no_untagged(tmp_path):
     # the category prefix.
     remainder = base[len("Anime_"):]
     assert remainder, f"category_tags produced only the category: {dst}"
+
+
+def test_ai_detect_tags_accepts_model_parameter(tmp_path):
+    """ai_detect_tags must accept an explicit model name without crashing."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import ai_detect_tags
+    img = Image.new("RGB", (50, 50), (200, 100, 50))
+    fp = tmp_path / "img.jpg"
+    img.save(fp, "JPEG")
+    # Heuristic ignores the model arg but should accept it gracefully.
+    tags, subject = ai_detect_tags(
+        str(fp), backend="heuristic", model="ignored-by-heuristic",
+        max_tags=3,
+    )
+    assert isinstance(tags, list)
+
+
+def test_ai_compute_renames_accepts_model_parameter(tmp_path):
+    """ai_compute_renames must accept and propagate model parameter."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import ai_compute_renames
+    img = Image.new("RGB", (50, 50), (100, 50, 200))
+    fp = tmp_path / "img.jpg"
+    img.save(fp, "JPEG")
+    # Non-tag strategy ignores model, but should still accept it.
+    pairs = ai_compute_renames(
+        [str(fp)], strategy="sequential", backend="heuristic",
+        category="Anime", model="any-model",
+    )
+    assert len(pairs) == 1
+
+
+def test_ai_rename_dialog_has_model_selector():
+    """AIRenameDialog must expose a model selector that's enabled for AI backends."""
+    import sys
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    from wallpaper_analyzer.gui.ai_rename_dialog import AIRenameDialog
+
+    # Heuristic: model selector disabled
+    dlg = AIRenameDialog(files=["/tmp/fake.jpg"], category="Anime",
+                         default_backend="heuristic")
+    assert dlg._model_combo.isEnabled() is False
+
+    # CLIP: model selector enabled with entries
+    dlg_clip = AIRenameDialog(files=["/tmp/fake.jpg"], category="Anime",
+                              default_backend="clip")
+    assert dlg_clip._model_combo.isEnabled() is True
+    assert dlg_clip._model_combo.count() >= 5  # (configured) + models
+
+    # Ollama: model selector enabled with entries
+    dlg_ollama = AIRenameDialog(files=["/tmp/fake.jpg"], category="Anime",
+                                default_backend="ollama")
+    assert dlg_ollama._model_combo.isEnabled() is True
+    assert dlg_ollama._model_combo.count() >= 5
+
+
+def test_ai_rename_dialog_model_picker_passes_through():
+    """Selecting a model must propagate to the preview job via _selected_model."""
+    import sys
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    from wallpaper_analyzer.gui.ai_rename_dialog import AIRenameDialog
+
+    dlg = AIRenameDialog(files=["/tmp/fake.jpg"], category="Anime",
+                         default_backend="clip",
+                         default_model="ViT-L/14")
+    # "(configured)" returns None; "ViT-L/14" returns the explicit name.
+    dlg._model_combo.setCurrentText("(configured)")
+    assert dlg._selected_model() is None
+    dlg._model_combo.setCurrentText("ViT-L/14")
+    assert dlg._selected_model() == "ViT-L/14"

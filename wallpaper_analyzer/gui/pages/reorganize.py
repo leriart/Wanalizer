@@ -1712,6 +1712,7 @@ class ReorganizePage(QWidget):
             default_strategy=strategy,
             max_tags=self._max_tags.value(),
             preview_limit=min(50, len(paths)),
+            default_model=self._active_ai_model_for_strategy(),
         )
         if dlg.exec() == QDialog.Accepted:
             self._status.setText("AI Rename complete")
@@ -1748,6 +1749,7 @@ class ReorganizePage(QWidget):
             default_strategy="category_tags",
             max_tags=self._max_tags.value(),
             preview_limit=cap,
+            default_model=self._active_ai_model_for_strategy(),
         )
         if dlg.exec() == QDialog.Accepted:
             self._status.setText(
@@ -1756,6 +1758,24 @@ class ReorganizePage(QWidget):
             self._refresh()
         else:
             self._status.setText("AI Rename cancelled")
+
+    def _active_ai_model_for_strategy(self) -> str:
+        """Return the active model from settings (CLIP or Ollama).
+
+        Used as the default model selection when opening the AI Rename
+        dialog so the user doesn't have to re-pick what they already
+        configured in the AI Models page.
+        """
+        try:
+            cfg = s.load_settings()
+            mode = cfg.get("organize_mode", "lowlevel")
+            if mode == "clip":
+                return cfg.get("clip_model", "ViT-B/32")
+            if mode == "ollama":
+                return cfg.get("ollama_model", "llava:7b")
+        except Exception:
+            pass
+        return ""
 
     def _category_files(self, category: str) -> List[str]:
         """Return absolute paths of all media files in `category` on disk."""
