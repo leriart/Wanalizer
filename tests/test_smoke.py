@@ -458,13 +458,23 @@ def test_ai_rename_dialog_default_backend_is_heuristic():
     assert dlg2._backend.currentData() == "heuristic"
 
 
-def test_clip_tag_vocab_is_capped():
-    """_clip_tag_vocab must not return thousands of tags — that would OOM."""
+def test_clip_tag_vocab_is_full():
+    """_clip_tag_vocab must return ALL curated tags (no artificial cap).
+
+    The user explicitly wants the AI not to be limited — capping the
+    vocab would hide legitimate tags. The encoded tensors are dropped
+    after each image in ``_clip_detect_tags`` to keep memory bounded
+    in a different way.
+    """
     from wallpaper_analyzer.rename import _clip_tag_vocab, _CLIP_TAG_VOCAB
     _CLIP_TAG_VOCAB.clear() if hasattr(_CLIP_TAG_VOCAB, "clear") else None
     vocab = _clip_tag_vocab()
-    assert len(vocab) <= 600, f"Vocab has {len(vocab)} tags — too large"
+    # Must be the full tag registry, not a small slice.
+    assert len(vocab) > 600, f"Vocab has only {len(vocab)} tags — limit too tight"
     assert all(isinstance(t, str) for t in vocab)
+    # All entries should be tag-shaped (1-20 chars, no spaces).
+    for t in vocab[:100]:
+        assert 1 < len(t) <= 20 and " " not in t
 
 
 def test_ai_rename_dialog_preview_limit_changes_apply_default():
@@ -480,3 +490,74 @@ def test_ai_rename_dialog_preview_limit_changes_apply_default():
         preview_limit=10,
     )
     assert dlg._preview_limit.value() == 10
+
+
+def test_fallback_tags_never_empty(tmp_path):
+    """_fallback_tags must always return at least one token."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import _fallback_tags
+    img = Image.new("RGB", (200, 200), (255, 0, 0))  # solid red
+    fp = tmp_path / "red.jpg"
+    img.save(fp, "JPEG")
+    tags = _fallback_tags(str(fp), [], max_tags=4)
+    assert len(tags) >= 1, "_fallback_tags returned empty list"
+    assert all(isinstance(t, str) and t for t in tags)
+
+
+def test_fallback_tags_combines_ai_with_deterministic(tmp_path):
+    """_fallback_tags should append deterministic tokens when AI list is short."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import _fallback_tags
+    img = Image.new("RGB", (1920, 1080), (50, 50, 200))  # 16:9, blue
+    fp = tmp_path / "widescreen.jpg"
+    img.save(fp, "JPEG")
+    # Give it only 1 AI tag, ask for 4 — should fill with deterministic.
+    tags = _fallback_tags(str(fp), ["sunset"], max_tags=4)
+    assert tags[0] == "sunset"
+    assert len(tags) >= 2
+    # The deterministic tokens should include "widescreen" since 16:9
+    # is closer to 16:9 bucket than to "square".
+    assert "widescreen" in tags
+
+
+def test_fallback_tags_on_missing_file_returns_hash():
+    """Missing file: still returns at least one token (the file hash)."""
+    from wallpaper_analyzer.rename import _fallback_tags
+    tags = _fallback_tags("/nonexistent/path/never.jpg", [], max_tags=3)
+    assert len(tags) >= 1
+
+
+def test_build_renames_no_untagged_in_output(tmp_path):
+    """Even when no AI tags are provided, output filenames must contain
+    real words — no 'untagged_NNN' placeholders."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import build_renames
+    img = Image.new("RGB", (1920, 1080), (50, 200, 100))
+    fp = tmp_path / "img.jpg"
+    img.save(fp, "JPEG")
+    pairs = build_renames([str(fp)], strategy="tags",
+                          tags_by_file={str(fp): []})
+    assert len(pairs) == 1
+    _, dst = pairs[0]
+    base = os.path.splitext(os.path.basename(dst))[0]
+    assert "untagged" not in base, f"Got untagged placeholder: {dst}"
+    assert base, f"Got empty base: {dst}"
+
+
+def test_build_renames_category_tags_no_untagged(tmp_path):
+    """category_tags strategy must not produce untagged filenames."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import build_renames
+    img = Image.new("RGB", (500, 500), (200, 50, 50))
+    fp = tmp_path / "img.jpg"
+    img.save(fp, "JPEG")
+    pairs = build_renames([str(fp)], strategy="category_tags",
+                          category="Anime",
+                          tags_by_file={str(fp): []})
+    _, dst = pairs[0]
+    base = os.path.splitext(os.path.basename(dst))[0]
+    assert base.startswith("Anime_")
+    # The remainder must have at least one descriptive token beyond
+    # the category prefix.
+    remainder = base[len("Anime_"):]
+    assert remainder, f"category_tags produced only the category: {dst}"

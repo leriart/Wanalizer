@@ -110,6 +110,136 @@ def _tag_components(tags: List[str], max_tags: int = 3) -> List[str]:
     return out
 
 
+# Aspect-ratio buckets used as a last-resort descriptor so the
+# filename always says *something* meaningful about the image even when
+# no AI tag backend responded.
+_ASPECT_BUCKETS = [
+    ((9, 21),  "ultrawide"),
+    ((9, 16),  "wide"),
+    ((3, 4),   "portrait"),
+    ((1, 1),   "square"),
+    ((4, 3),   "standard"),
+    ((16, 10), "wide"),
+    ((16, 9),  "widescreen"),
+    ((21, 9),  "ultrawide"),
+]
+
+
+def _aspect_token(path: str) -> str:
+    """Return a short token describing the aspect-ratio bucket of `path`.
+
+    Falls back to "image" if the file can't be opened.
+    """
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(path) as im:
+            w, h = im.size
+        if w <= 0 or h <= 0:
+            return "image"
+        ratio = w / h
+        # Pre-compute (ratio, name) pairs once.
+        ratios = [(nw / nh, name) for (nw, nh), name in _ASPECT_BUCKETS]
+        best_name = min(ratios, key=lambda r: abs(r[0] - ratio))[1]
+        return best_name
+    except Exception:
+        return "image"
+
+
+def _color_tokens(path: str, max_colors: int = 3) -> List[str]:
+    """Return a list of dominant colour tokens for `path`.
+
+    Always returns at least one token (or an empty list if the file
+    can't be opened). Tokens are sanitised for use as filename parts.
+    """
+    try:
+        from PIL import Image as _PILImage
+        from .profile import extract_color_weights
+        with _PILImage.open(path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((128, 128), _PILImage.LANCZOS)
+            weights, _ = extract_color_weights(im)
+        # Take the top-N colours by weight; rename them with human words.
+        items = sorted(weights.items(), key=lambda kv: -kv[1])[:max_colors]
+        out: List[str] = []
+        seen: set = set()
+        # Friendly labels for the most common dominant-colour buckets.
+        LABELS = {
+            "black": "black", "white": "white", "gray": "gray",
+            "red": "red", "green": "green", "blue": "blue",
+            "yellow": "yellow", "orange": "orange", "purple": "purple",
+            "pink": "pink", "brown": "brown", "cyan": "cyan", "magenta": "magenta",
+        }
+        for color, _w in items:
+            tok = sanitize_tag(LABELS.get(color.lower(), color))
+            if tok and tok not in seen:
+                seen.add(tok)
+                out.append(tok)
+        return out
+    except Exception:
+        return []
+
+
+def _brightness_token(path: str) -> str:
+    """Return 'dark' / 'mid' / 'bright' based on the image's mean luminance."""
+    try:
+        from PIL import Image as _PILImage, ImageStat as _ImageStat
+        with _PILImage.open(path) as im:
+            im = im.convert("L")
+            im.thumbnail((64, 64), _PILImage.LANCZOS)
+            mean = _ImageStat.Stat(im).mean[0]
+        if mean < 64:
+            return "dark"
+        if mean > 192:
+            return "bright"
+        return "mid"
+    except Exception:
+        return ""
+
+
+def _fallback_tags(path: str, primary: List[str], max_tags: int = 4) -> List[str]:
+    """Always-return-something tag list.
+
+    Combines the AI-supplied `primary` tags with deterministic
+    fallback tokens derived from the image itself:
+      1. The top-N dominant colour names (e.g. ['red', 'orange']).
+      2. The image's aspect-ratio bucket (e.g. 'widescreen').
+      3. The image's brightness bucket (e.g. 'dark').
+
+    The fallback tokens are only added if there is room left after the
+    primary tags. The function never returns an empty list — the caller
+    always gets at least one descriptive token, which means
+    ``build_renames`` will never produce an ``untagged_NNN`` filename.
+    """
+    out: List[str] = []
+    seen: set = set()
+    for t in primary or []:
+        s = sanitize_tag(t)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+        if len(out) >= max_tags:
+            return out
+    # Augment with deterministic per-image descriptors.
+    for c in _color_tokens(path, max_colors=max(1, max_tags - len(out))):
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+        if len(out) >= max_tags:
+            return out
+    asp = _aspect_token(path)
+    if asp and asp not in seen:
+        out.append(asp)
+        seen.add(asp)
+    if len(out) < max_tags:
+        br = _brightness_token(path)
+        if br and br not in seen:
+            out.append(br)
+    # Last-ditch: short content hash so we still get a unique-ish token.
+    if not out:
+        out.append(file_md5_8(path))
+    return out[:max_tags]
+
+
 def build_renames(
     files: List[str],
     strategy: str,
@@ -194,28 +324,34 @@ def build_renames(
             new_base = f"{timestamp}_{base}"
         elif strategy == "tags":
             file_tags = tags_by_file.get(old_path) or []
-            comps = _tag_components(file_tags, max_tags=max_tags)
-            new_base = "_".join(comps) if comps else f"untagged_{n:0{pad}d}"
+            comps = _fallback_tags(old_path, file_tags, max_tags=max_tags)
+            new_base = "_".join(comps)
         elif strategy == "category_tags":
             cat = sanitize(category or os.path.basename(directory) or "file") or "file"
             file_tags = tags_by_file.get(old_path) or []
-            comps = _tag_components(file_tags, max_tags=max_tags)
-            new_base = "_".join([cat] + comps) if comps else f"{cat}_{n:0{pad}d}"
+            comps = _fallback_tags(old_path, file_tags, max_tags=max_tags)
+            # Category first, then as many tag tokens as fit (subject +
+            # colors + aspect) so the filename stays in max_tags total
+            # components when joined.
+            tag_budget = max(1, max_tags)
+            new_base = "_".join([cat] + comps[:tag_budget])
         elif strategy == "subject_tags":
             subject = sanitize_tag(subject_by_file.get(old_path) or "")
             file_tags = tags_by_file.get(old_path) or []
-            comps = _tag_components(file_tags, max_tags=max_tags)
+            comps = _fallback_tags(old_path, file_tags, max_tags=max_tags)
             parts: List[str] = []
             if subject:
                 parts.append(subject)
             for c in comps:
                 if c and c not in parts:
                     parts.append(c)
-            new_base = "_".join(parts) if parts else f"file_{n:0{pad}d}"
+            new_base = "_".join(parts) if parts else "_".join(
+                _fallback_tags(old_path, [], max_tags=max_tags)
+            )
         elif strategy == "date_tags":
             file_tags = tags_by_file.get(old_path) or []
-            comps = _tag_components(file_tags, max_tags=max_tags)
-            new_base = "_".join([today] + comps) if comps else f"{today}_untagged_{n:0{pad}d}"
+            comps = _fallback_tags(old_path, file_tags, max_tags=max_tags)
+            new_base = "_".join([today] + comps)
         else:
             new_base = base
 
@@ -444,24 +580,20 @@ _CLIP_TAG_VOCAB: Optional[List[str]] = None
 def _clip_tag_vocab() -> List[str]:
     """Return the cached CLIP tag vocabulary, building it lazily.
 
-    The full `_tags_flat` registry can hold thousands of tags. Encoding
-    them all into CLIP text features at once uses a lot of memory and
-    slows down the dialog. We cap the vocab at a size that's plenty for
-    describing wallpapers (~600 tags is enough for any realistic image
-    and keeps the CLIP forward pass cheap).
+    The full `_tags_flat` registry can hold many tags. We prefer
+    short, generally-descriptive tags (2-20 chars, no spaces) and
+    keep the full list — the user explicitly wants AI not to be
+    limited. Memory is still bounded because we encode in batches
+    inside ``_clip_detect_tags`` and explicitly drop the tensors.
     """
     global _CLIP_TAG_VOCAB
     if _CLIP_TAG_VOCAB is not None:
         return _CLIP_TAG_VOCAB
     try:
         from .tags import _tags_flat
-        # Prefer tags that look generally descriptive: lowercase, no
-        # spaces, 2-20 chars. Cap the list so we don't allocate a
-        # multi-megabyte text-feature matrix for tens of thousands of
-        # obscure tags.
         vocab = sorted(t for t in _tags_flat
                        if 1 < len(t) <= 20 and " " not in t)
-        _CLIP_TAG_VOCAB = vocab[:600]
+        _CLIP_TAG_VOCAB = vocab
     except Exception:
         _CLIP_TAG_VOCAB = []
     return _CLIP_TAG_VOCAB
@@ -474,8 +606,10 @@ def _clip_detect_tags(image_path: str, max_tags: int = 8,
     Returns the top-`max_tags` tags (highest CLIP cosine). Falls back to
     an empty list if CLIP is not installed / the model failed to load.
 
-    Memory-conscious: explicitly drops the text/feature tensors after
-    computing the top-k so large batched runs don't accumulate state.
+    Memory-conscious: encodes the text vocabulary in batches so we
+    don't allocate a multi-megabyte text-feature matrix in one go,
+    and explicitly drops all tensors after computing the top-k so long
+    batched runs don't accumulate state.
     """
     try:
         from .clip_client import get_engine
@@ -488,26 +622,38 @@ def _clip_detect_tags(image_path: str, max_tags: int = 8,
         img_feat = engine.encode_image(image_path)
         if img_feat is None:
             return [], None
-        text_feats_list = engine.encode_texts(vocab)
-        if not text_feats_list or any(t is None for t in text_feats_list):
-            return [], None
+        # Encode vocab in batches to keep peak memory bounded.
         import torch
         import numpy as np
-        text_feats = torch.stack([t for t in text_feats_list], dim=0)
-        sims = (img_feat.to(text_feats.device) @ text_feats.T).squeeze(0)
-        scores = sims.detach().cpu().numpy()
+        BATCH = 128
+        device = img_feat.device
+        sims_chunks: List["torch.Tensor"] = []
+        valid_vocab: List[str] = []
+        for i in range(0, len(vocab), BATCH):
+            chunk = vocab[i:i + BATCH]
+            chunk_feats_list = engine.encode_texts(chunk)
+            if not chunk_feats_list or any(t is None for t in chunk_feats_list):
+                continue
+            chunk_feats = torch.stack([t for t in chunk_feats_list], dim=0)
+            chunk_sims = (img_feat.to(chunk_feats.device) @ chunk_feats.T).squeeze(0)
+            sims_chunks.append(chunk_sims.detach().cpu())
+            valid_vocab.extend(chunk)
+            del chunk_feats, chunk_sims
+        if not sims_chunks:
+            return [], None
+        sims = torch.cat(sims_chunks, dim=0)
+        scores = sims.numpy()
         order = np.argsort(-scores)
-        top = []
+        top: List[str] = []
         for idx in order[:max_tags]:
             if float(scores[idx]) <= 0:
                 break
-            top.append(vocab[int(idx)])
+            top.append(valid_vocab[int(idx)])
         # Drop large tensors — they accumulate over many files otherwise.
-        del sims, scores, text_feats
+        del sims, scores, sims_chunks
         try:
-            import torch as _t
-            if _t.cuda.is_available():
-                _t.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except Exception:
             pass
         return top, (top[0] if top else None)
@@ -586,32 +732,42 @@ def ai_detect_tags(
         _emit("ollama", f"Querying Ollama for {os.path.basename(image_path)}")
         tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags, category=category)
         if tags or subj:
-            return tags, subj
-        _emit("fallback", "Ollama failed, falling back to heuristic")
-        return get_tags_for_file(image_path, category=category, max_tags=max_tags)
+            # Always wrap with the deterministic fallback so the result
+            # is never empty — augments AI tags with colour/aspect/brightness.
+            return _fallback_tags(image_path, tags, max_tags=max_tags), subj
+        _emit("fallback", "Ollama returned no tags, using deterministic fallback")
+        return _fallback_tags(image_path, [], max_tags=max_tags), None
 
     if backend == "clip":
         _emit("clip", f"Scoring CLIP tag vocabulary for {os.path.basename(image_path)}")
         tags, subj = _clip_detect_tags(image_path, max_tags=max_tags, category=category)
         if tags or subj:
-            return tags, subj
-        _emit("fallback", "CLIP failed, falling back to heuristic")
-        return get_tags_for_file(image_path, category=category, max_tags=max_tags)
+            return _fallback_tags(image_path, tags, max_tags=max_tags), subj
+        _emit("fallback", "CLIP returned no tags, using deterministic fallback")
+        return _fallback_tags(image_path, [], max_tags=max_tags), None
 
     if backend == "heuristic":
         _emit("heuristic", f"Running heuristic tagger on {os.path.basename(image_path)}")
-        return get_tags_for_file(image_path, category=category, max_tags=max_tags)
+        return _fallback_tags(
+            image_path,
+            get_tags_for_file(image_path, category=category, max_tags=max_tags),
+            max_tags=max_tags,
+        ), None
 
-    # auto: try Ollama → CLIP → heuristic.
+    # auto: try Ollama → CLIP → heuristic → deterministic fallback.
     _emit("auto", f"Auto-detecting tags for {os.path.basename(image_path)}")
     tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags, category=category)
     if tags or subj:
-        return tags, subj
+        return _fallback_tags(image_path, tags, max_tags=max_tags), subj
     tags, subj = _clip_detect_tags(image_path, max_tags=max_tags, category=category)
     if tags or subj:
-        return tags, subj
-    _emit("fallback", "All AI backends failed, using heuristic")
-    return get_tags_for_file(image_path, category=category, max_tags=max_tags)
+        return _fallback_tags(image_path, tags, max_tags=max_tags), subj
+    _emit("fallback", "All AI backends returned no tags, using deterministic fallback")
+    return _fallback_tags(
+        image_path,
+        get_tags_for_file(image_path, category=category, max_tags=max_tags),
+        max_tags=max_tags,
+    ), None
 
 
 def ai_compute_renames(
