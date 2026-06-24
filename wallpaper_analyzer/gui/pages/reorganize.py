@@ -640,6 +640,29 @@ class ReorganizePage(QWidget):
         self.btn_rename_only.setEnabled(False)
         hl.addWidget(self.btn_rename_only)
 
+        self.btn_ai_rename = QPushButton("AI Rename...")
+        self.btn_ai_rename.setObjectName("success")
+        self.btn_ai_rename.setToolTip(
+            "AI-powered rename: pick a backend (Ollama / CLIP / "
+            "Heuristic / Auto) and rename the currently visible "
+            "files using AI-detected content tags. Supports preview "
+            "and dry-run."
+        )
+        self.btn_ai_rename.clicked.connect(self._on_ai_rename)
+        self.btn_ai_rename.setEnabled(False)
+        hl.addWidget(self.btn_ai_rename)
+
+        self.btn_ai_rename_cat = QPushButton("AI Rename category...")
+        self.btn_ai_rename_cat.setObjectName("primary")
+        self.btn_ai_rename_cat.setToolTip(
+            "Pick a category in the sidebar, then click this to rename "
+            "EVERY file in that category at once using AI-detected tags. "
+            "Opens the AI Rename dialog with the full category pre-loaded."
+        )
+        self.btn_ai_rename_cat.clicked.connect(self._on_ai_rename_category)
+        self.btn_ai_rename_cat.setEnabled(False)
+        hl.addWidget(self.btn_ai_rename_cat)
+
         self.btn_dupes = QPushButton("Find Duplicates")
         self.btn_dupes.setObjectName("ghost")
         self.btn_dupes.clicked.connect(self._on_find_duplicates)
@@ -1665,6 +1688,85 @@ class ReorganizePage(QWidget):
         else:
             self._status.setText("Rename cancelled")
 
+    def _on_ai_rename(self):
+        """Open the AI Rename dialog for the current selection/view."""
+        paths = self._current_paths_for_rename()
+        if not paths:
+            QMessageBox.information(
+                self, "No files",
+                "Select files in the grid first, or pick a category "
+                "in the sidebar to populate the view."
+            )
+            return
+        from ..ai_rename_dialog import AIRenameDialog
+        strategy = self._rename_strat.currentData() or "category_tags"
+        # For tag-based strategies, default to the tag-aware options.
+        dlg = AIRenameDialog(
+            paths,
+            category=self._cur_cat,
+            parent=self,
+            default_strategy=strategy,
+            max_tags=self._max_tags.value(),
+        )
+        if dlg.exec() == QDialog.Accepted:
+            self._status.setText("AI Rename complete")
+            self._refresh()
+        else:
+            self._status.setText("AI Rename cancelled")
+
+    def _on_ai_rename_category(self):
+        """Run an AI-powered rename on every file in the chosen category.
+
+        Pops up an AI Rename dialog seeded with the full category file
+        list (regardless of the current filter/search), so the user can
+        rename every wallpaper in the category in one shot.
+        """
+        # Build the file list from disk so filters/searches don't hide files.
+        paths = self._category_files(self._cur_cat) if self._cur_cat else []
+        if not paths:
+            QMessageBox.information(
+                self, "Empty category",
+                "Pick a category in the sidebar first.\n"
+                "Files inside it will be queued for AI rename."
+            )
+            return
+        from ..ai_rename_dialog import AIRenameDialog
+        dlg = AIRenameDialog(
+            paths,
+            category=self._cur_cat,
+            parent=self,
+            default_strategy="category_tags",
+            max_tags=self._max_tags.value(),
+        )
+        if dlg.exec() == QDialog.Accepted:
+            self._status.setText(
+                f"AI Rename complete — {len(paths)} files in '{self._cur_cat}'"
+            )
+            self._refresh()
+        else:
+            self._status.setText("AI Rename cancelled")
+
+    def _category_files(self, category: str) -> List[str]:
+        """Return absolute paths of all media files in `category` on disk."""
+        if not category:
+            return []
+        dest = s.resolve_dest_dir(s.load_settings())
+        cat_dir = os.path.join(dest, category)
+        if not os.path.isdir(cat_dir):
+            return []
+        exts = f.STATIC_EXTENSIONS | f.ANIMATED_EXTENSIONS
+        out: List[str] = []
+        for fn in sorted(os.listdir(cat_dir)):
+            fp = os.path.join(cat_dir, fn)
+            if not os.path.isfile(fp):
+                continue
+            if fn.startswith("."):
+                continue
+            if os.path.splitext(fn)[1].lower() not in exts:
+                continue
+            out.append(fp)
+        return out
+
     def _on_rename_strat_changed(self):
         """Show strategy hint and toggle controls."""
         strat = self._rename_strat.currentData() or ""
@@ -1693,6 +1795,11 @@ class ReorganizePage(QWidget):
         has_files = bool(self._visible or self._all_files)
         self.btn_rename.setEnabled(has_files)
         self.btn_rename_only.setEnabled(has_files)
+        self.btn_ai_rename.setEnabled(has_files)
+        # The category-wide AI rename is enabled whenever a category is
+        # selected — even with an empty visible selection, the user
+        # may want to rename every file in the category.
+        self.btn_ai_rename_cat.setEnabled(bool(self._cur_cat))
 
     def _on_rename_only(self):
         """Rename the currently visible files in place — no move.

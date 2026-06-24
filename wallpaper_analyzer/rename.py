@@ -428,3 +428,209 @@ def compute_renames(
 def clear_tags_cache() -> None:
     """Drop the in-memory profile/tags cache."""
     _PROFILE_TAGS_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# AI-powered tag detection (CLIP / Ollama)
+# ---------------------------------------------------------------------------
+
+# Curated tag vocabulary used for CLIP-based ranking. These are short,
+# generic, descriptive words that compose well into filenames like
+# "moonlit_neon_kimono.jpg". Curated from the same registry used by
+# Ollama's prompt; filtered for word-shape compatibility.
+_CLIP_TAG_VOCAB: Optional[List[str]] = None
+
+
+def _clip_tag_vocab() -> List[str]:
+    """Return the cached CLIP tag vocabulary, building it lazily."""
+    global _CLIP_TAG_VOCAB
+    if _CLIP_TAG_VOCAB is not None:
+        return _CLIP_TAG_VOCAB
+    try:
+        from .tags import _tags_flat
+        # Build prompts that CLIP will score against. Use the same "a photo
+        # of X" template the CLIP client uses elsewhere.
+        vocab = sorted(t for t in _tags_flat if 1 < len(t) <= 20 and " " not in t)
+        _CLIP_TAG_VOCAB = vocab
+    except Exception:
+        _CLIP_TAG_VOCAB = []
+    return _CLIP_TAG_VOCAB
+
+
+def _clip_detect_tags(image_path: str, max_tags: int = 8,
+                     category: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
+    """Use CLIP to rank the curated tag vocabulary by visual similarity.
+
+    Returns the top-`max_tags` tags (highest CLIP cosine). Falls back to
+    an empty list if CLIP is not installed / the model failed to load.
+    """
+    try:
+        from .clip_client import get_engine
+        engine = get_engine()
+        if not engine.available:
+            return [], None
+        vocab = _clip_tag_vocab()
+        if not vocab:
+            return [], None
+        img_feat = engine.encode_image(image_path)
+        if img_feat is None:
+            return [], None
+        # Encode all vocab tags as a single batch.
+        text_feats_list = engine.encode_texts(vocab)
+        if not text_feats_list or any(t is None for t in text_feats_list):
+            return [], None
+        import torch
+        text_feats = torch.stack([t for t in text_feats_list], dim=0)
+        sims = (img_feat.to(text_feats.device) @ text_feats.T).squeeze(0)
+        scores = sims.detach().cpu().numpy()
+        # Top-k indices, sorted by score descending.
+        import numpy as np
+        order = np.argsort(-scores)
+        top = []
+        for idx in order[:max_tags]:
+            if float(scores[idx]) <= 0:
+                break
+            top.append(vocab[int(idx)])
+        return top, (top[0] if top else None)
+    except Exception:
+        return [], None
+
+
+def _ollama_detect_tags(image_path: str, max_tags: int = 8,
+                       category: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
+    """Use a local Ollama vision model to describe and tag the image."""
+    try:
+        from . import settings as _settings
+        from .ollama_client import OllamaClient
+        cfg = _settings.load_settings()
+        client = OllamaClient(
+            base_url=cfg.get("ollama_url", "http://localhost:11434"),
+            model=cfg.get("ollama_model", "llava:7b"),
+            timeout=int(cfg.get("ollama_timeout", 60)),
+        )
+        tags = client.detect_tags(image_path, max_tags=max_tags) or []
+        subject = client.detect_main_subject(image_path)
+        client.close()
+        return tags, subject
+    except Exception:
+        return [], None
+
+
+# Backend identifiers accepted by ai_detect_tags()
+AI_TAG_BACKENDS = ("auto", "heuristic", "clip", "ollama")
+
+
+def ai_detect_tags(
+    image_path: str,
+    backend: str = "auto",
+    category: Optional[str] = None,
+    max_tags: int = 8,
+    progress_cb=None,
+) -> Tuple[List[str], Optional[str]]:
+    """Detect descriptive tags using the requested AI backend.
+
+    Args:
+        image_path: absolute path to the image.
+        backend: one of ``AI_TAG_BACKENDS``.
+            * ``auto``       — try Ollama, then CLIP, then heuristic.
+            * ``ollama``     — force the local Ollama vision model.
+            * ``clip``       — force the local OpenAI CLIP model.
+            * ``heuristic``  — pure CV pipeline (no AI).
+        category: optional category hint used by the heuristic fallback
+            and surfaced in logs.
+        max_tags: cap on the returned tag list.
+        progress_cb: optional ``callable(stage, msg)`` for status updates.
+
+    Returns:
+        ``(tags, subject)``. Both can be empty/None on failure.
+    """
+    if backend not in AI_TAG_BACKENDS:
+        # Unknown backend — fall back to heuristic rather than "auto",
+        # because "auto" would attempt to reach Ollama/CLIP first and
+        # could hang on connection timeouts.
+        backend = "heuristic"
+
+    def _emit(stage, msg):
+        if progress_cb:
+            try:
+                progress_cb(stage, msg)
+            except Exception:
+                pass
+
+    if backend == "ollama":
+        _emit("ollama", f"Querying Ollama for {os.path.basename(image_path)}")
+        tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags, category=category)
+        if tags or subj:
+            return tags, subj
+        _emit("fallback", "Ollama failed, falling back to heuristic")
+        return get_tags_for_file(image_path, category=category, max_tags=max_tags)
+
+    if backend == "clip":
+        _emit("clip", f"Scoring CLIP tag vocabulary for {os.path.basename(image_path)}")
+        tags, subj = _clip_detect_tags(image_path, max_tags=max_tags, category=category)
+        if tags or subj:
+            return tags, subj
+        _emit("fallback", "CLIP failed, falling back to heuristic")
+        return get_tags_for_file(image_path, category=category, max_tags=max_tags)
+
+    if backend == "heuristic":
+        _emit("heuristic", f"Running heuristic tagger on {os.path.basename(image_path)}")
+        return get_tags_for_file(image_path, category=category, max_tags=max_tags)
+
+    # auto: try Ollama → CLIP → heuristic.
+    _emit("auto", f"Auto-detecting tags for {os.path.basename(image_path)}")
+    tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags, category=category)
+    if tags or subj:
+        return tags, subj
+    tags, subj = _clip_detect_tags(image_path, max_tags=max_tags, category=category)
+    if tags or subj:
+        return tags, subj
+    _emit("fallback", "All AI backends failed, using heuristic")
+    return get_tags_for_file(image_path, category=category, max_tags=max_tags)
+
+
+def ai_compute_renames(
+    files: List[str],
+    strategy: str,
+    backend: str = "auto",
+    category: Optional[str] = None,
+    max_tags: int = 3,
+    pad: int = 3,
+    start: int = 1,
+    truncate_len: int = 32,
+    progress_cb=None,
+) -> List[Tuple[str, str]]:
+    """Build rename pairs using AI-detected tags.
+
+    Like ``compute_renames`` but uses ``ai_detect_tags`` (CLIP / Ollama)
+    for tag-based strategies. For non-tag strategies the result is
+    identical to ``build_renames``.
+    """
+    needs_tags = strategy in TAG_BASED_STRATEGIES
+    tags_by_file: Dict[str, List[str]] = {}
+    subject_by_file: Dict[str, Optional[str]] = {}
+    if needs_tags:
+        total = len(files)
+        for i, p in enumerate(files, 1):
+            tags, subject = ai_detect_tags(
+                p, backend=backend, category=category, max_tags=max_tags,
+                progress_cb=progress_cb,
+            )
+            tags_by_file[p] = tags
+            subject_by_file[p] = subject
+            if progress_cb and (i % 5 == 0 or i == total):
+                try:
+                    progress_cb("progress", i, total)
+                except Exception:
+                    pass
+    return build_renames(
+        files,
+        strategy=strategy,
+        category=category or "",
+        start=start,
+        pad=pad,
+        truncate_len=truncate_len,
+        tags_by_file=tags_by_file,
+        subject_by_file=subject_by_file,
+        max_tags=max_tags,
+    )

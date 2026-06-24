@@ -335,3 +335,83 @@ def test_reorganize_rename_button_text():
     assert "btn_rename_only" in src
     assert "_RenameJob" in src
     assert "compute_renames" in src or "build_renames" in src
+
+
+def test_ai_tag_backends_constant():
+    from wallpaper_analyzer.rename import AI_TAG_BACKENDS
+    assert "auto" in AI_TAG_BACKENDS
+    assert "ollama" in AI_TAG_BACKENDS
+    assert "clip" in AI_TAG_BACKENDS
+    assert "heuristic" in AI_TAG_BACKENDS
+
+
+def test_ai_detect_tags_heuristic_returns_tuple(tmp_path):
+    """ai_detect_tags with backend='heuristic' returns a (tags, subject) tuple."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import ai_detect_tags
+    # Create a small test image with content the heuristic should recognise.
+    img = Image.new("RGB", (200, 200), (255, 0, 0))  # pure red
+    fp = tmp_path / "red.jpg"
+    img.save(fp, "JPEG")
+    tags, subject = ai_detect_tags(str(fp), backend="heuristic", max_tags=5)
+    assert isinstance(tags, list)
+    assert isinstance(subject, (str, type(None)))
+    # Heuristic on pure red should at least return some colour tag
+    # (the fallback uses top-3 colour names from palette_weights).
+    assert all(isinstance(t, str) for t in tags)
+
+
+def test_ai_detect_tags_unknown_backend_falls_back(tmp_path):
+    """Invalid backend string should fall back to heuristic (no crash)."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import ai_detect_tags
+    img = Image.new("RGB", (100, 100), (0, 0, 255))
+    fp = tmp_path / "blue.jpg"
+    img.save(fp, "JPEG")
+    tags, subject = ai_detect_tags(str(fp), backend="bogus", max_tags=5)
+    assert isinstance(tags, list)
+
+
+def test_ai_compute_renames_non_tag_strategy(tmp_path):
+    """Non-tag strategies shouldn't try to call any AI backend."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import ai_compute_renames
+    img = Image.new("RGB", (50, 50), (128, 128, 128))
+    fp = tmp_path / "img.jpg"
+    img.save(fp, "JPEG")
+    pairs = ai_compute_renames([str(fp)], strategy="category", category="Anime")
+    assert len(pairs) == 1
+    _, dst = pairs[0]
+    assert os.path.basename(dst).startswith("Anime_")
+
+
+def test_ai_rename_dialog_exists():
+    """The AIRenameDialog module must exist and be importable."""
+    from wallpaper_analyzer.gui.ai_rename_dialog import AIRenameDialog, _PreviewJob
+    assert callable(AIRenameDialog)
+    assert callable(_PreviewJob)
+
+
+def test_reorganize_has_ai_rename_buttons():
+    """Reorganize header must expose AI Rename + AI Rename category."""
+    import inspect
+    from wallpaper_analyzer.gui.pages import reorganize
+    src = inspect.getsource(reorganize)
+    assert "btn_ai_rename" in src
+    assert "btn_ai_rename_cat" in src
+    assert "_on_ai_rename" in src
+    assert "_on_ai_rename_category" in src
+    assert "_category_files" in src
+    assert "AIRenameDialog" in src
+
+
+def test_ai_compute_renames_invalid_backend_falls_back(tmp_path):
+    """Invalid backend should behave like 'auto' and still produce pairs."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import ai_compute_renames
+    img = Image.new("RGB", (60, 60), (10, 200, 50))
+    fp = tmp_path / "img.jpg"
+    img.save(fp, "JPEG")
+    pairs = ai_compute_renames([str(fp)], strategy="category", backend="bogus",
+                               category="Anime")
+    assert len(pairs) == 1
