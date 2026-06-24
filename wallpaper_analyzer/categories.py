@@ -4,7 +4,11 @@ from typing import Dict, List, Optional, Set
 
 from .settings import resolve_dest_dir, load_settings
 
-SPECIAL_FOLDERS: Set[str] = {"Duplicates", "Low-Quality", "Discarded", "Uncategorized", "NSFW"}
+# Folders the *system* creates automatically that should NOT appear in the
+# user-facing categories list (Duplicates, Low-Quality, Discarded,
+# Uncategorized). NSFW is treated as a regular category so the user can
+# see/browse/rename the NSFW wallpapers — see is_managed_category().
+SPECIAL_FOLDERS: Set[str] = {"Duplicates", "Low-Quality", "Discarded", "Uncategorized"}
 NSFW_FOLDER: str = "NSFW"
 LOW_QUALITY_FOLDER: str = "Low-Quality"
 DISCARDED_FOLDER: str = "Discarded"
@@ -40,11 +44,29 @@ def write_category_config(folder_name: str, config: Dict) -> bool:
 
 
 def _is_category_folder(folder_name: str) -> bool:
+    """Return True for any folder that should be exposed to the user.
+
+    NSFW is included here (it's a real, browsable category with NSFW
+    wallpapers). SPECIAL_FOLDERS contains only folders the system creates
+    and manages entirely (Duplicates / Low-Quality / Discarded /
+    Uncategorized) — those don't represent user-facing categories.
+    """
     if folder_name.startswith(".") or folder_name.startswith("_"):
         return False
     if folder_name in SPECIAL_FOLDERS:
         return False
     return os.path.isdir(os.path.join(CATEGORIES_DIR, folder_name))
+
+
+def is_managed_category(name: str) -> bool:
+    """True for categories whose contents are auto-managed by the system.
+
+    NSFW is the only one right now — wallpapers end up there based on the
+    NSFW classifier, not because the user dragged them in. UI layers use
+    this to render a special badge and to prevent NSFW from appearing as
+    a target in the "import images" dialog.
+    """
+    return name == NSFW_FOLDER
 
 
 def list_category_folders(dest: Optional[str] = None,
@@ -53,7 +75,8 @@ def list_category_folders(dest: Optional[str] = None,
 
     Defaults to CATEGORIES_DIR when no path is given. By default the
     list contains every subfolder of `dest` that is not in
-    SPECIAL_FOLDERS, including folders without a `.category.json`.
+    SPECIAL_FOLDERS, including folders without a `.category.json`
+    (so a freshly created NSFW folder still shows up).
     Set `include_unconfigured=False` to restrict to folders that have a
     `.category.json` (i.e. already discovered).
     """
@@ -68,6 +91,10 @@ def list_category_folders(dest: Optional[str] = None,
         if not os.path.isdir(p):
             continue
         if not include_unconfigured:
+            if name == NSFW_FOLDER:
+                # NSFW is always listed even without .category.json
+                out.append(name)
+                continue
             if not os.path.isfile(os.path.join(p, ".category.json")):
                 continue
         out.append(name)
@@ -89,7 +116,10 @@ def count_media_in(folder: str) -> int:
 def _build_category_icons():
     CATEGORY_ICONS.clear()
     for cat in CATEGORIES:
-        CATEGORY_ICONS[cat] = f"[{cat[:3].upper():<3}]"
+        if cat == NSFW_FOLDER:
+            CATEGORY_ICONS[cat] = "[NSFW]"
+        else:
+            CATEGORY_ICONS[cat] = f"[{cat[:3].upper():<3}]"
     for name in ["Black", "White", "Gray", "Other", "Multicolor"]:
         if name not in CATEGORY_ICONS:
             CATEGORY_ICONS[name] = f"[{name[:3].upper()}]"
@@ -111,9 +141,12 @@ def discover_categories(categories_dir: Optional[str] = None):
         if not _is_category_folder(entry):
             continue
         cfg = _read_category_config(entry)
-        if cfg is None:
+        # NSFW is always a category, even without a .category.json.
+        if cfg is None and entry != NSFW_FOLDER:
             continue
         CATEGORIES.append(entry)
+        if cfg is None:
+            continue
         pw = cfg.get("palette_weights")
         if pw and isinstance(pw, dict):
             _PALETTE_WEIGHTS_CACHE[entry] = {str(k): float(v) for k, v in pw.items()}
@@ -141,7 +174,16 @@ def get_palette_weights(category: str) -> Dict[str, float]:
 def get_category_config(category: str) -> Dict:
     cfg = _read_category_config(category)
     if cfg is None:
-        return {"name": category, "tags": [], "prompt": "", "palette_weights": {}}
+        # NSFW folder may exist without a .category.json — provide a
+        # sensible default that still allows the UI to render it.
+        defaults = {"name": category, "tags": [], "prompt": "",
+                     "palette_weights": {}}
+        if category == NSFW_FOLDER:
+            defaults["managed"] = True
+            defaults["prompt"] = "Auto-managed NSFW folder. Wallpapers end up here based on the NSFW classifier; you can still browse, rename, and move them out manually."
+        return defaults
+    if category == NSFW_FOLDER and "managed" not in cfg:
+        cfg["managed"] = True
     return cfg
 
 
@@ -151,10 +193,16 @@ def create_category(name: str) -> bool:
     if os.path.exists(fld):
         return False
     os.makedirs(fld)
-    return write_category_config(name, {"name": name, "tags": [], "prompt": "", "palette_weights": {}})
+    cfg = {"name": name, "tags": [], "prompt": "", "palette_weights": {}}
+    if name == NSFW_FOLDER:
+        cfg["managed"] = True
+    return write_category_config(name, cfg)
 
 
 def delete_category(name: str) -> bool:
+    if name == NSFW_FOLDER:
+        # Refuse to delete the auto-managed NSFW folder via the UI.
+        return False
     import shutil
     fld = os.path.join(CATEGORIES_DIR, name)
     if not os.path.isdir(fld):

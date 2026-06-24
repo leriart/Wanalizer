@@ -134,7 +134,16 @@ class DashboardPage(QWidget):
                 p = os.path.join(dest, e)
                 if not os.path.isdir(p) or e.startswith("."):
                     continue
-                is_cat = (e in c.CATEGORIES or os.path.isfile(os.path.join(p, ".category.json")))
+                # NSFW is now a category too (so it appears in the
+                # Reorganize sidebar), but it's auto-managed by the
+                # classifier so we count it separately in the dashboard.
+                if e == c.NSFW_FOLDER:
+                    nsfw += sum(1 for f in os.listdir(p)
+                                if os.path.isfile(os.path.join(p, f))
+                                and not f.startswith("."))
+                    continue
+                is_cat = (e in c.CATEGORIES
+                          or os.path.isfile(os.path.join(p, ".category.json")))
                 if is_cat:
                     n_cats += 1
                     n_files += sum(
@@ -143,8 +152,6 @@ class DashboardPage(QWidget):
                     )
                 elif e == c.DUPLICATES_FOLDER:
                     dupes += sum(1 for f in os.listdir(p) if os.path.isfile(os.path.join(p, f)))
-                elif e == c.NSFW_FOLDER:
-                    nsfw += sum(1 for f in os.listdir(p) if os.path.isfile(os.path.join(p, f)))
         self._cards["total"].setText(str(n_files))
         self._cards["cats"].setText(str(n_cats))
         self._cards["dupes"].setText(str(dupes))

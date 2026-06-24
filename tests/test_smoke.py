@@ -131,12 +131,69 @@ def test_cli_source_rejects_missing_dir():
     assert formats.WALLPAPERS_DIR == original
 
 
-def test_categories_special_folders_contains_nsfw():
-    from wallpaper_analyzer.categories import SPECIAL_FOLDERS, NSFW_FOLDER
+def test_categories_special_folders_excludes_nsfw():
+    """NSFW is a browsable category (not a hidden special folder).
 
-    assert NSFW_FOLDER in SPECIAL_FOLDERS
+    The original audit flagged that NSFW was both treated as a regular
+    category AND skipped in some places; the fix is to keep it as a
+    category and use is_managed_category() to mark it as auto-managed.
+    """
+    from wallpaper_analyzer.categories import (
+        SPECIAL_FOLDERS, NSFW_FOLDER, is_managed_category,
+    )
+
+    assert NSFW_FOLDER not in SPECIAL_FOLDERS
     assert "Duplicates" in SPECIAL_FOLDERS
     assert "Low-Quality" in SPECIAL_FOLDERS
+    assert is_managed_category(NSFW_FOLDER)
+    assert not is_managed_category("Anime")
+
+
+def test_nsfw_folder_appears_in_categories(tmp_path):
+    """NSFW folder must show up in the category list even without config.
+
+    Even folders without a `.category.json` (like NSFW before any user
+    action) are visible so the user can see the count and browse them.
+    """
+    from wallpaper_analyzer.categories import (
+        discover_categories, list_category_folders, NSFW_FOLDER,
+    )
+    import json
+
+    (tmp_path / "Anime").mkdir()
+    (tmp_path / "Anime" / ".category.json").write_text(json.dumps({"name": "Anime"}))
+    (tmp_path / NSFW_FOLDER).mkdir()
+    (tmp_path / NSFW_FOLDER / "y.jpg").write_bytes(b"y")
+    (tmp_path / "Duplicates").mkdir()  # should NOT appear
+
+    discover_categories(str(tmp_path))
+    from wallpaper_analyzer.categories import CATEGORIES
+    assert NSFW_FOLDER in CATEGORIES
+    assert "Anime" in CATEGORIES
+    assert "Duplicates" not in CATEGORIES
+
+    folders = list_category_folders(str(tmp_path))
+    assert NSFW_FOLDER in folders
+    assert "Anime" in folders
+    assert "Duplicates" not in folders
+
+
+def test_nsfw_folder_default_config():
+    """get_category_config returns sensible defaults for NSFW with no config."""
+    from wallpaper_analyzer.categories import get_category_config, NSFW_FOLDER
+
+    cfg = get_category_config(NSFW_FOLDER)
+    assert cfg["name"] == NSFW_FOLDER
+    assert cfg.get("managed") is True
+    assert "tags" in cfg
+    assert "prompt" in cfg
+
+
+def test_nsfw_folder_cannot_be_deleted():
+    """delete_category refuses to remove the NSFW folder."""
+    from wallpaper_analyzer.categories import delete_category, NSFW_FOLDER
+
+    assert delete_category(NSFW_FOLDER) is False
 
 
 def test_list_category_folders_helper(tmp_path):

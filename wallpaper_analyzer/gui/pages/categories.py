@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QFormLayout, QComboBox, QSpinBox, QCheckBox,
 )
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QColor
 from ..workers import GenerateTagsWorker, RegenerateCategoryWorker
 from ..widgets import BTN_TEXT, BTN_KIND, BTN_DATA, setup_table_buttons, min_button_column_width, refresh_action_columns
 from ..category_config_dialog import CategoryConfigDialog, AIConfigDialog
@@ -461,15 +462,24 @@ class CategoriesPage(QWidget):
             exp_source = exp.get("source", "")
             exp_marker = ""
             if exp_source and exp_source != "default":
-                exp_marker = " \u2698"  # gear icon for "configured"
-            self._table.setItem(i, 0, QTableWidgetItem(nm + (" *" if not hc else "") + exp_marker))
+                exp_marker = " ⚙"  # gear icon for "configured"
+            managed = c.is_managed_category(nm)
+            managed_marker = " 🔒" if managed else ""
+            name_label = nm + (" *" if not hc else "") + exp_marker + managed_marker
+            name_item = QTableWidgetItem(name_label)
+            if managed:
+                # Tint NSFW row red so it's visually unmistakable.
+                name_item.setForeground(QColor("#e06060"))
+            self._table.setItem(i, 0, name_item)
             self._table.setItem(i, 1, QTableWidgetItem(str(cnt)))
             tags = cfg.get("tags", [])
             prompt = cfg.get("prompt", "")
             desc_lines = []
+            if managed:
+                desc_lines.append("auto-managed (NSFW classifier)")
             if tags:
                 desc_lines.append(", ".join(tags[:6]))
-            elif not hc:
+            elif not hc and not managed:
                 desc_lines.append("needs tags")
             if prompt:
                 desc_lines.append(f"[prompt] {prompt[:50]}{'...' if len(prompt) > 50 else ''}")
@@ -487,10 +497,25 @@ class CategoriesPage(QWidget):
             self._table.setItem(i, 2, QTableWidgetItem(desc))
             self._table.setItem(i, 4, QTableWidgetItem(nm))
 
-            act = QTableWidgetItem()
-            act.setData(BTN_TEXT, "Edit|Gen|+|Del" if cnt > 0 else "Edit|+|Del")
-            act.setData(BTN_KIND, "edit|gen|plus|del" if cnt > 0 else "edit|plus|del")
-            act.setData(BTN_DATA, nm)
+            # Action buttons — managed categories skip "Import" (+)
+            # since their contents are auto-managed by the NSFW classifier.
+            # Delete is also disabled (delete_category refuses NSFW).
+            if managed:
+                if cnt > 0:
+                    act = QTableWidgetItem()
+                    act.setData(BTN_TEXT, "Edit")
+                    act.setData(BTN_KIND, "edit")
+                    act.setData(BTN_DATA, nm)
+                else:
+                    act = QTableWidgetItem()
+                    act.setData(BTN_TEXT, "Edit")
+                    act.setData(BTN_KIND, "edit")
+                    act.setData(BTN_DATA, nm)
+            else:
+                act = QTableWidgetItem()
+                act.setData(BTN_TEXT, "Edit|Gen|+|Del" if cnt > 0 else "Edit|+|Del")
+                act.setData(BTN_KIND, "edit|gen|plus|del" if cnt > 0 else "edit|plus|del")
+                act.setData(BTN_DATA, nm)
             self._table.setItem(i, 3, act)
 
         refresh_action_columns(self._table)
@@ -902,6 +927,13 @@ class CategoriesPage(QWidget):
         # _on_gen_finished triggers next via re-queue
 
     def _del(self, name):
+        if c.is_managed_category(name):
+            QMessageBox.information(
+                self, "Cannot delete",
+                f"'{name}' is auto-managed by the NSFW classifier.\n"
+                "Move its files into another category if you want to empty it.",
+            )
+            return
         r = QMessageBox.question(
             self, "Delete", f"Delete category '{name}' and ALL files inside?",
             QMessageBox.Yes | QMessageBox.No,
