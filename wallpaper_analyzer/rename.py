@@ -442,16 +442,26 @@ _CLIP_TAG_VOCAB: Optional[List[str]] = None
 
 
 def _clip_tag_vocab() -> List[str]:
-    """Return the cached CLIP tag vocabulary, building it lazily."""
+    """Return the cached CLIP tag vocabulary, building it lazily.
+
+    The full `_tags_flat` registry can hold thousands of tags. Encoding
+    them all into CLIP text features at once uses a lot of memory and
+    slows down the dialog. We cap the vocab at a size that's plenty for
+    describing wallpapers (~600 tags is enough for any realistic image
+    and keeps the CLIP forward pass cheap).
+    """
     global _CLIP_TAG_VOCAB
     if _CLIP_TAG_VOCAB is not None:
         return _CLIP_TAG_VOCAB
     try:
         from .tags import _tags_flat
-        # Build prompts that CLIP will score against. Use the same "a photo
-        # of X" template the CLIP client uses elsewhere.
-        vocab = sorted(t for t in _tags_flat if 1 < len(t) <= 20 and " " not in t)
-        _CLIP_TAG_VOCAB = vocab
+        # Prefer tags that look generally descriptive: lowercase, no
+        # spaces, 2-20 chars. Cap the list so we don't allocate a
+        # multi-megabyte text-feature matrix for tens of thousands of
+        # obscure tags.
+        vocab = sorted(t for t in _tags_flat
+                       if 1 < len(t) <= 20 and " " not in t)
+        _CLIP_TAG_VOCAB = vocab[:600]
     except Exception:
         _CLIP_TAG_VOCAB = []
     return _CLIP_TAG_VOCAB
@@ -463,6 +473,9 @@ def _clip_detect_tags(image_path: str, max_tags: int = 8,
 
     Returns the top-`max_tags` tags (highest CLIP cosine). Falls back to
     an empty list if CLIP is not installed / the model failed to load.
+
+    Memory-conscious: explicitly drops the text/feature tensors after
+    computing the top-k so large batched runs don't accumulate state.
     """
     try:
         from .clip_client import get_engine
@@ -475,22 +488,28 @@ def _clip_detect_tags(image_path: str, max_tags: int = 8,
         img_feat = engine.encode_image(image_path)
         if img_feat is None:
             return [], None
-        # Encode all vocab tags as a single batch.
         text_feats_list = engine.encode_texts(vocab)
         if not text_feats_list or any(t is None for t in text_feats_list):
             return [], None
         import torch
+        import numpy as np
         text_feats = torch.stack([t for t in text_feats_list], dim=0)
         sims = (img_feat.to(text_feats.device) @ text_feats.T).squeeze(0)
         scores = sims.detach().cpu().numpy()
-        # Top-k indices, sorted by score descending.
-        import numpy as np
         order = np.argsort(-scores)
         top = []
         for idx in order[:max_tags]:
             if float(scores[idx]) <= 0:
                 break
             top.append(vocab[int(idx)])
+        # Drop large tensors — they accumulate over many files otherwise.
+        del sims, scores, text_feats
+        try:
+            import torch as _t
+            if _t.cuda.is_available():
+                _t.cuda.empty_cache()
+        except Exception:
+            pass
         return top, (top[0] if top else None)
     except Exception:
         return [], None
@@ -498,7 +517,11 @@ def _clip_detect_tags(image_path: str, max_tags: int = 8,
 
 def _ollama_detect_tags(image_path: str, max_tags: int = 8,
                        category: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
-    """Use a local Ollama vision model to describe and tag the image."""
+    """Use a local Ollama vision model to describe and tag the image.
+
+    Closes the client after each call so the underlying HTTP session
+    doesn't accumulate open connections across many files.
+    """
     try:
         from . import settings as _settings
         from .ollama_client import OllamaClient
@@ -508,10 +531,12 @@ def _ollama_detect_tags(image_path: str, max_tags: int = 8,
             model=cfg.get("ollama_model", "llava:7b"),
             timeout=int(cfg.get("ollama_timeout", 60)),
         )
-        tags = client.detect_tags(image_path, max_tags=max_tags) or []
-        subject = client.detect_main_subject(image_path)
-        client.close()
-        return tags, subject
+        try:
+            tags = client.detect_tags(image_path, max_tags=max_tags) or []
+            subject = client.detect_main_subject(image_path)
+            return tags, subject
+        finally:
+            client.close()
     except Exception:
         return [], None
 

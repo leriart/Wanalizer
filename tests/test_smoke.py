@@ -415,3 +415,68 @@ def test_ai_compute_renames_invalid_backend_falls_back(tmp_path):
     pairs = ai_compute_renames([str(fp)], strategy="category", backend="bogus",
                                category="Anime")
     assert len(pairs) == 1
+
+
+def test_ai_rename_dialog_no_auto_preview():
+    """The dialog must NOT auto-start tag detection on open.
+
+    This was the root cause of the OOM crash: opening the dialog used to
+    fire ai_compute_renames immediately, which (for Ollama/CLIP backends)
+    blew memory before the user could pick a backend.
+    """
+    import sys
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    from wallpaper_analyzer.gui.ai_rename_dialog import AIRenameDialog
+    dlg = AIRenameDialog(
+        files=[f"/tmp/fake_{i}.jpg" for i in range(100)],
+        category="Anime",
+    )
+    assert dlg._preview_job is None or not dlg._preview_job.isRunning()
+    assert dlg._has_preview is False
+    assert dlg._apply_btn.isEnabled() is False
+    assert dlg._stop_btn.isEnabled() is False
+    assert dlg._run_btn.isEnabled() is True
+
+
+def test_ai_rename_dialog_default_backend_is_heuristic():
+    """Default backend must be 'heuristic' (safe, no AI)."""
+    import sys
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    from wallpaper_analyzer.gui.ai_rename_dialog import AIRenameDialog
+    dlg = AIRenameDialog(
+        files=["/tmp/fake.jpg"], category="Anime",
+        default_backend="ollama",  # caller override is honoured
+    )
+    assert dlg._backend.currentData() == "ollama"
+
+    # Without a caller override we fall back to heuristic.
+    dlg2 = AIRenameDialog(files=["/tmp/fake.jpg"], category="Anime")
+    assert dlg2._backend.currentData() == "heuristic"
+
+
+def test_clip_tag_vocab_is_capped():
+    """_clip_tag_vocab must not return thousands of tags — that would OOM."""
+    from wallpaper_analyzer.rename import _clip_tag_vocab, _CLIP_TAG_VOCAB
+    _CLIP_TAG_VOCAB.clear() if hasattr(_CLIP_TAG_VOCAB, "clear") else None
+    vocab = _clip_tag_vocab()
+    assert len(vocab) <= 600, f"Vocab has {len(vocab)} tags — too large"
+    assert all(isinstance(t, str) for t in vocab)
+
+
+def test_ai_rename_dialog_preview_limit_changes_apply_default():
+    """The preview_limit parameter must cap how many files are processed."""
+    import sys
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    from wallpaper_analyzer.gui.ai_rename_dialog import AIRenameDialog
+    dlg = AIRenameDialog(
+        files=[f"/tmp/f_{i}.jpg" for i in range(200)],
+        category="Anime",
+        preview_limit=10,
+    )
+    assert dlg._preview_limit.value() == 10

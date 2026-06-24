@@ -1700,13 +1700,18 @@ class ReorganizePage(QWidget):
             return
         from ..ai_rename_dialog import AIRenameDialog
         strategy = self._rename_strat.currentData() or "category_tags"
-        # For tag-based strategies, default to the tag-aware options.
+        # Default to heuristic — it's safe, instant, and the user
+        # can switch to CLIP/Ollama from inside the dialog. This avoids
+        # the OOM crash we saw when Auto tried Ollama on a large
+        # selection before the user could intervene.
         dlg = AIRenameDialog(
             paths,
             category=self._cur_cat,
             parent=self,
+            default_backend="heuristic",
             default_strategy=strategy,
             max_tags=self._max_tags.value(),
+            preview_limit=min(50, len(paths)),
         )
         if dlg.exec() == QDialog.Accepted:
             self._status.setText("AI Rename complete")
@@ -1731,12 +1736,18 @@ class ReorganizePage(QWidget):
             )
             return
         from ..ai_rename_dialog import AIRenameDialog
+        # If the user has many files in the category, start the preview
+        # cap low so the dialog opens instantly and the user can grow
+        # the cap once they're sure the backend works.
+        cap = 50 if len(paths) > 50 else len(paths)
         dlg = AIRenameDialog(
             paths,
             category=self._cur_cat,
             parent=self,
+            default_backend="heuristic",
             default_strategy="category_tags",
             max_tags=self._max_tags.value(),
+            preview_limit=cap,
         )
         if dlg.exec() == QDialog.Accepted:
             self._status.setText(
