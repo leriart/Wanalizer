@@ -111,47 +111,85 @@ def _list_ollama_models() -> List[str]:
 class _PreviewJob(QThread):
     """Compute preview pairs in the background so the dialog stays responsive.
 
-    Honors an internal ``cancel`` flag so the user can stop a slow
-    preview without closing the dialog.
+    Uses ``AIRenamer`` directly so the Ollama HTTP client and per-file
+    tag cache are reused across the batch (and survive across preview
+    refreshes within the same dialog session). Honors an internal
+    ``cancel`` flag so the user can stop a slow preview without
+    closing the dialog.
     """
-    progress = Signal(int, int, str)
-    finished_ok = Signal(list, list)  # pairs, log_lines
+    progress = Signal(int, int, str)         # (cur, total, msg)
+    finished_ok = Signal(list, list)         # (pairs, log_lines)
     failed = Signal(str)
 
-    def __init__(self, files, strategy, backend, category, max_tags, model=None):
+    def __init__(self, files, strategy, backend, category, max_tags,
+                 model=None, force_reprocess=False):
         super().__init__()
         self.files = list(files)
         self.strategy = strategy
         self.backend = backend
         self.category = category
         self.max_tags = max_tags
-        self.model = model  # explicit model name (CLIP / Ollama)
+        self.model = model
+        self.force_reprocess = force_reprocess
         self._cancel = False
+        # Filled in by run(); used by the slot to surface per-file stats.
+        self.renamer: Optional[object] = None
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
         try:
+            from ..rename import AIRenamer, TAG_BASED_STRATEGIES, build_renames
+
             log: List[str] = []
-            def _cb(stage, *args):
+            ren = AIRenamer(
+                backend=self.backend,
+                model=self.model,
+                max_tags=self.max_tags,
+                force_reprocess=self.force_reprocess,
+            )
+            self.renamer = ren
+
+            # Emit batch-level progress (count of files).
+            total = len(self.files)
+            self.progress.emit(0, total, f"Processing {total} files with {self.backend}…")
+
+            # Iterate per-file so we can emit granular progress events.
+            # detect_tags() never raises — failures are isolated and
+            # logged. We build the rename pair inline so the user
+            # sees results as they come in.
+            tags_by_file = {}
+            subject_by_file = {}
+            for i, p in enumerate(self.files, 1):
                 if self._cancel:
                     raise InterruptedError("cancelled")
-                if stage == "progress":
-                    cur, total = args
-                    self.progress.emit(cur, total, f"Tagged {cur}/{total}")
-                else:
-                    msg = args[0] if args else stage
-                    log.append(f"[{stage}] {msg}")
-            pairs = ai_compute_renames(
-                self.files,
-                strategy=self.strategy,
-                backend=self.backend,
-                category=self.category,
-                max_tags=self.max_tags,
-                model=self.model,
-                progress_cb=_cb,
-            )
+                tags, subject = ren.detect_tags(p, category=self.category)
+                tags_by_file[p] = tags
+                subject_by_file[p] = subject
+                self.progress.emit(
+                    i, total,
+                    f"{i}/{total}: {os.path.basename(p)} → {tags[:3]}",
+                )
+
+            # Build rename pairs only for tag-based strategies; for
+            # other strategies the per-file tags aren't needed.
+            if self.strategy in TAG_BASED_STRATEGIES:
+                pairs = build_renames(
+                    self.files, strategy=self.strategy,
+                    category=self.category or "",
+                    tags_by_file=tags_by_file,
+                    subject_by_file=subject_by_file,
+                    max_tags=self.max_tags,
+                )
+            else:
+                pairs = build_renames(
+                    self.files, strategy=self.strategy,
+                    category=self.category or "",
+                )
+
+            # Drain renamer log to the dialog log too.
+            log.extend(ren.log_lines)
             self.finished_ok.emit(pairs, log)
         except InterruptedError:
             self.failed.emit("Cancelled")
@@ -181,8 +219,11 @@ class AIRenameDialog(QDialog):
         self._pairs: List[Tuple[str, str]] = []
         self._preview_job: Optional[_PreviewJob] = None
         self._has_preview = False
+        # Default to force-reprocess so every dialog open runs the AI
+        # over the full file list — the user's explicit ask.
+        self._force_reprocess = True
         self.setWindowTitle(f"AI Rename — {len(self.files)} files")
-        self.setMinimumSize(840, 700)
+        self.setMinimumSize(840, 720)
         self._build(default_backend, default_strategy, max_tags, preview_limit)
         # NOTE: we intentionally do NOT auto-run preview here. The user
         # explicitly clicks "Run preview" once the settings are right.
@@ -275,6 +316,20 @@ class AIRenameDialog(QDialog):
             "Set to the total to preview everything."
         )
         sg_layout.addRow("Preview limit:", self._preview_limit)
+
+        self._force_reprocess_chk = QCheckBox(
+            "Reprocess every image (bypass AI tag cache)"
+        )
+        self._force_reprocess_chk.setChecked(self._force_reprocess)
+        self._force_reprocess_chk.setToolTip(
+            "When checked, every image is re-tagged from scratch even if "
+            "it was already processed earlier in this session. Slower but "
+            "guarantees the latest model / settings are used for every file."
+        )
+        self._force_reprocess_chk.toggled.connect(
+            lambda v: setattr(self, "_force_reprocess", v)
+        )
+        sg_layout.addRow(self._force_reprocess_chk)
 
         self._dry = QCheckBox("Dry run (preview only)")
         self._dry.setChecked(False)
@@ -517,6 +572,7 @@ class AIRenameDialog(QDialog):
             category=self.category,
             max_tags=self._max_tags.value(),
             model=model,
+            force_reprocess=self._force_reprocess,
         )
         self._preview_job.progress.connect(self._on_preview_progress)
         self._preview_job.finished_ok.connect(self._on_preview_done)
@@ -543,7 +599,18 @@ class AIRenameDialog(QDialog):
         backend = self._backend.currentData()
         model = self._selected_model()
         label = backend + (f" / {model}" if model else " / (configured)")
-        status = f"Preview ready — {label} • {len(pairs)} pair(s)"
+        # Surface AIRenamer stats (processed / cached / failed) so the
+        # user knows how many files were retagged vs served from cache
+        # vs failed outright.
+        ren = getattr(self._preview_job, "renamer", None)
+        stats_extra = ""
+        if ren is not None:
+            stats_extra = (
+                f"  •  processed {ren.processed}"
+                f"  •  cache hits {ren.cached_hits}"
+                f"  •  failed {ren.failed}"
+            )
+        status = f"Preview ready — {label} • {len(pairs)} pair(s){stats_extra}"
         if log_lines:
             status += f"  ({len(log_lines)} log lines)"
         self._backend_status.setText(status)

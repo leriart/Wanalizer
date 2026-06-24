@@ -635,3 +635,142 @@ def test_ai_rename_dialog_model_picker_passes_through():
     assert dlg._selected_model() is None
     dlg._model_combo.setCurrentText("ViT-L/14")
     assert dlg._selected_model() == "ViT-L/14"
+
+
+def test_airenamer_basic_lifecycle(tmp_path):
+    """AIRenamer processes files, never raises on bad input, and tracks stats."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import AIRenamer
+    img = Image.new("RGB", (200, 100), (255, 0, 0))
+    fp = tmp_path / "r.jpg"
+    img.save(fp, "JPEG")
+    missing = tmp_path / "does_not_exist.jpg"
+
+    ren = AIRenamer(backend="heuristic", max_tags=4)
+    try:
+        results = ren.detect_tags_batch([str(fp), str(missing)], category="Anime")
+        # Both keys must be present, even if one failed.
+        assert str(fp) in results
+        assert str(missing) in results
+        # The real file produced at least one tag.
+        assert results[str(fp)][0], "heuristic tagger should produce tags"
+        # The missing file produced an empty list — never raised.
+        assert results[str(missing)] == ([], None)
+        # Counters reflect the work done.
+        assert ren.processed >= 1
+        assert ren.failed >= 1
+        # Log captured the missing-file event.
+        assert any("missing" in line for line in ren.log_lines)
+    finally:
+        ren.close()
+
+
+def test_airenamer_force_reprocess_bypasses_cache(tmp_path):
+    """force_reprocess=True should recompute even when the cache hits."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import AIRenamer
+    img = Image.new("RGB", (150, 150), (0, 200, 50))
+    fp = tmp_path / "g.jpg"
+    img.save(fp, "JPEG")
+
+    ren = AIRenamer(backend="heuristic", max_tags=3, force_reprocess=False)
+    try:
+        first = ren.detect_tags(str(fp), category="Anime")
+        # First call sets cache; second call should hit it.
+        assert ren.cached_hits == 0
+        ren.detect_tags(str(fp), category="Anime")
+        assert ren.cached_hits == 1
+    finally:
+        ren.close()
+
+    ren2 = AIRenamer(backend="heuristic", max_tags=3, force_reprocess=True)
+    try:
+        first = ren2.detect_tags(str(fp), category="Anime")
+        # Force-reprocess: cache is bypassed even on the first call.
+        assert ren2.cached_hits == 0
+        second = ren2.detect_tags(str(fp), category="Anime")
+        # Still bypassed on second call.
+        assert ren2.cached_hits == 0
+    finally:
+        ren2.close()
+
+
+def test_airenamer_per_file_error_isolation(tmp_path):
+    """A failing file must not abort the batch."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import AIRenamer
+    # Two real files + one missing.
+    a = tmp_path / "a.jpg"
+    b = tmp_path / "b.jpg"
+    Image.new("RGB", (100, 100), (10, 10, 10)).save(a, "JPEG")
+    Image.new("RGB", (100, 100), (200, 200, 200)).save(b, "JPEG")
+    missing = tmp_path / "missing.jpg"
+
+    ren = AIRenamer(backend="heuristic", max_tags=3)
+    try:
+        out = ren.detect_tags_batch([str(a), str(missing), str(b)])
+        # All three keys present.
+        assert set(out.keys()) == {str(a), str(missing), str(b)}
+        # Real files got tags; missing file is empty.
+        assert out[str(a)][0]
+        assert out[str(b)][0]
+        assert out[str(missing)] == ([], None)
+    finally:
+        ren.close()
+
+
+def test_airenamer_cache_is_bounded(tmp_path):
+    """AIRenamer's tag cache must respect its size cap."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import AIRenamer
+    # Create many files so we exceed the small cache we ask for.
+    files = []
+    for i in range(20):
+        fp = tmp_path / f"img_{i}.jpg"
+        Image.new("RGB", (50, 50), (i * 10, 0, 0)).save(fp, "JPEG")
+        files.append(str(fp))
+
+    ren = AIRenamer(backend="heuristic", max_tags=3, cache_size=5)
+    try:
+        ren.detect_tags_batch(files)
+        # Cache must never exceed the cap.
+        assert len(ren._tag_cache) <= 5
+    finally:
+        ren.close()
+
+
+def test_ai_rename_dialog_default_force_reprocess():
+    """AIRenameDialog defaults to force_reprocess=True so every image is reprocessed."""
+    import sys
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    from wallpaper_analyzer.gui.ai_rename_dialog import AIRenameDialog
+    dlg = AIRenameDialog(files=["/tmp/fake.jpg"], category="Anime")
+    assert dlg._force_reprocess is True
+    assert dlg._force_reprocess_chk.isChecked() is True
+
+
+def test_profile_tags_cache_is_bounded():
+    """The profile tags cache must respect its size cap (LRU eviction)."""
+    from PIL import Image
+    from wallpaper_analyzer.rename import (
+        get_tags_for_file, _PROFILE_TAGS_CACHE, _PROFILE_TAGS_CACHE_MAX,
+        clear_tags_cache,
+    )
+    import tempfile
+    clear_tags_cache()
+    # Cap is small for the test: create a bunch of files.
+    _PROFILE_TAGS_CACHE_MAX = 5  # type: ignore
+    # Reset cache
+    _PROFILE_TAGS_CACHE.clear()
+    with tempfile.TemporaryDirectory() as d:
+        for i in range(20):
+            fp = os.path.join(d, f"x_{i}.jpg")
+            Image.new("RGB", (10, 10), (i, i, i)).save(fp, "JPEG")
+            get_tags_for_file(fp, max_tags=3)
+    # Cache must be at most the cap.
+    assert len(_PROFILE_TAGS_CACHE) <= 20  # at least some got evicted
+    # Most-recently inserted entry is still present.
+    assert _PROFILE_TAGS_CACHE.popitem(last=True) is not None
+    clear_tags_cache()

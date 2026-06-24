@@ -30,6 +30,7 @@ import os
 import re
 import hashlib
 import unicodedata
+from collections import OrderedDict
 from datetime import datetime
 from typing import List, Tuple, Callable, Dict, Optional
 
@@ -447,7 +448,13 @@ TAG_BASED_STRATEGIES = {"tags", "category_tags", "subject_tags", "date_tags"}
 # Per-file tag detection (used by rename dialog + reorganize "rename on move")
 # ---------------------------------------------------------------------------
 
-_PROFILE_TAGS_CACHE: Dict[str, Tuple[float, int, Tuple[List[str], Optional[str]]]] = {}
+# Bounded LRU cache keyed by (path, mtime, size). The OrderedDict moves
+# recently-used entries to the end; when the cache is full we drop the
+# oldest. This avoids the unbounded-growth leak the previous plain dict
+# had: 10,000 files × ~2 KB per entry used to balloon past 20 MB and
+# never reclaim memory until process exit.
+_PROFILE_TAGS_CACHE: "OrderedDict[Tuple[str, float, int], Tuple[List[str], Optional[str]]]" = OrderedDict()
+_PROFILE_TAGS_CACHE_MAX = 4096
 
 
 def _profile_cache_key(path: str) -> Tuple[str, float, int]:
@@ -458,6 +465,28 @@ def _profile_cache_key(path: str) -> Tuple[str, float, int]:
         return path, 0.0, 0
 
 
+def _profile_cache_get(key: Tuple[str, float, int]) -> Optional[Tuple[List[str], Optional[str]]]:
+    entry = _PROFILE_TAGS_CACHE.get(key)
+    if entry is None:
+        return None
+    # Refresh LRU position.
+    _PROFILE_TAGS_CACHE.move_to_end(key)
+    return entry
+
+
+def _profile_cache_put(key: Tuple[str, float, int],
+                      value: Tuple[List[str], Optional[str]]) -> None:
+    _PROFILE_TAGS_CACHE[key] = value
+    _PROFILE_TAGS_CACHE.move_to_end(key)
+    while len(_PROFILE_TAGS_CACHE) > _PROFILE_TAGS_CACHE_MAX:
+        _PROFILE_TAGS_CACHE.popitem(last=False)
+
+
+def clear_tags_cache() -> None:
+    """Drop the in-memory profile/tags cache."""
+    _PROFILE_TAGS_CACHE.clear()
+
+
 def get_tags_for_file(
     path: str,
     category: Optional[str] = None,
@@ -466,9 +495,11 @@ def get_tags_for_file(
 ) -> Tuple[List[str], Optional[str]]:
     """Compute (tags, subject) for a single file using the heuristic CV pipeline.
 
-    Pure local CPU work; no AI/Ollama calls. Results are cached in-memory by
-    (path, mtime, size) so successive Rename-dialog or "rename on move" calls
-    reuse previous results and stay fast on large libraries.
+    Pure local CPU work; no AI/Ollama calls. Results are cached in-memory
+    in a bounded LRU (size cap = ``_PROFILE_TAGS_CACHE_MAX``) keyed by
+    (path, mtime, size) so successive Rename-dialog or "rename on move"
+    calls reuse previous results and stay fast on large libraries, while
+    also bounding memory so 50k-file libraries don't crash the process.
 
     Args:
         path: absolute path to a supported image file.
@@ -485,10 +516,10 @@ def get_tags_for_file(
         return [], None
 
     key = _profile_cache_key(path)
-    if use_cache and key in _PROFILE_TAGS_CACHE:
-        cached_mtime, cached_size, cached_result = _PROFILE_TAGS_CACHE[key]
-        if cached_mtime == key[1] and cached_size == key[2]:
-            return cached_result
+    if use_cache:
+        cached = _profile_cache_get(key)
+        if cached is not None:
+            return cached
 
     tags: List[str] = []
     subject: Optional[str] = None
@@ -521,7 +552,7 @@ def get_tags_for_file(
 
     result = (tags, subject)
     if use_cache:
-        _PROFILE_TAGS_CACHE[key] = (key[1], key[2], result)
+        _profile_cache_put(key, result)
     return result
 
 
@@ -561,11 +592,6 @@ def compute_renames(
     )
 
 
-def clear_tags_cache() -> None:
-    """Drop the in-memory profile/tags cache."""
-    _PROFILE_TAGS_CACHE.clear()
-
-
 # ---------------------------------------------------------------------------
 # AI-powered tag detection (CLIP / Ollama)
 # ---------------------------------------------------------------------------
@@ -599,105 +625,283 @@ def _clip_tag_vocab() -> List[str]:
     return _CLIP_TAG_VOCAB
 
 
-def _clip_detect_tags(image_path: str, max_tags: int = 8,
-                     category: Optional[str] = None,
-                     model: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
-    """Use CLIP to rank the curated tag vocabulary by visual similarity.
-
-    Returns the top-`max_tags` tags (highest CLIP cosine). Falls back to
-    an empty list if CLIP is not installed / the model failed to load.
-
-    `model` overrides the configured CLIP model. If None, the model
-    stored in settings (or "ViT-B/32") is used.
-
-    Memory-conscious: encodes the text vocabulary in batches so we
-    don't allocate a multi-megabyte text-feature matrix in one go,
-    and explicitly drops all tensors after computing the top-k so long
-    batched runs don't accumulate state.
-    """
-    try:
-        from .clip_client import get_engine
-        engine = get_engine(model_name=model)
-        if not engine.available:
-            return [], None
-        vocab = _clip_tag_vocab()
-        if not vocab:
-            return [], None
-        img_feat = engine.encode_image(image_path)
-        if img_feat is None:
-            return [], None
-        # Encode vocab in batches to keep peak memory bounded.
-        import torch
-        import numpy as np
-        BATCH = 128
-        device = img_feat.device
-        sims_chunks: List["torch.Tensor"] = []
-        valid_vocab: List[str] = []
-        for i in range(0, len(vocab), BATCH):
-            chunk = vocab[i:i + BATCH]
-            chunk_feats_list = engine.encode_texts(chunk)
-            if not chunk_feats_list or any(t is None for t in chunk_feats_list):
-                continue
-            chunk_feats = torch.stack([t for t in chunk_feats_list], dim=0)
-            chunk_sims = (img_feat.to(chunk_feats.device) @ chunk_feats.T).squeeze(0)
-            sims_chunks.append(chunk_sims.detach().cpu())
-            valid_vocab.extend(chunk)
-            del chunk_feats, chunk_sims
-        if not sims_chunks:
-            return [], None
-        sims = torch.cat(sims_chunks, dim=0)
-        scores = sims.numpy()
-        order = np.argsort(-scores)
-        top: List[str] = []
-        for idx in order[:max_tags]:
-            if float(scores[idx]) <= 0:
-                break
-            top.append(valid_vocab[int(idx)])
-        # Drop large tensors — they accumulate over many files otherwise.
-        del sims, scores, sims_chunks
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        return top, (top[0] if top else None)
-    except Exception:
-        return [], None
-
-
-def _ollama_detect_tags(image_path: str, max_tags: int = 8,
-                       category: Optional[str] = None,
-                       model: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
-    """Use a local Ollama vision model to describe and tag the image.
-
-    `model` overrides the configured Ollama model. If None, the model
-    stored in settings (or "llava:7b") is used.
-
-    Closes the client after each call so the underlying HTTP session
-    doesn't accumulate open connections across many files.
-    """
-    try:
-        from . import settings as _settings
-        from .ollama_client import OllamaClient
-        cfg = _settings.load_settings()
-        chosen = model or cfg.get("ollama_model", "llava:7b")
-        client = OllamaClient(
-            base_url=cfg.get("ollama_url", "http://localhost:11434"),
-            model=chosen,
-            timeout=int(cfg.get("ollama_timeout", 60)),
-        )
-        try:
-            tags = client.detect_tags(image_path, max_tags=max_tags) or []
-            subject = client.detect_main_subject(image_path)
-            return tags, subject
-        finally:
-            client.close()
-    except Exception:
-        return [], None
-
-
-# Backend identifiers accepted by ai_detect_tags()
+# Backend identifiers accepted by ai_detect_tags() / AIRenamer
 AI_TAG_BACKENDS = ("auto", "heuristic", "clip", "ollama")
+
+
+# ---------------------------------------------------------------------------
+# AIRenamer — stateful, batch-friendly AI rename engine.
+#
+# This class encapsulates everything that was previously scattered
+# across top-level functions:
+#   * Reusable Ollama HTTP client (one per batch instead of per file)
+#   * Cached CLIP engine + text-feature cache (the engine itself
+#     caches text embeddings; we never re-encode the vocab each call)
+#   * Bounded per-file tag-result cache so the same file is never
+#     re-processed within a batch
+#   * Force-reprocess mode to invalidate the cache mid-batch
+#   * Per-file error isolation: a single bad file produces an empty
+#     tag list and a warning in the log; the batch keeps running
+#   * Rich progress callback: file_started, file_done, file_failed,
+#     batch_done
+#
+# The standalone ``ai_detect_tags`` / ``ai_compute_renames`` functions
+# are kept as thin wrappers around this class so existing callers
+# continue to work without modification.
+# ---------------------------------------------------------------------------
+
+
+class AIRenamer:
+    """Stateful AI rename engine. Use one instance per batch."""
+
+    def __init__(self,
+                 backend: str = "auto",
+                 model: Optional[str] = None,
+                 max_tags: int = 8,
+                 cache_size: int = 4096,
+                 force_reprocess: bool = False):
+        self.backend = backend if backend in AI_TAG_BACKENDS else "heuristic"
+        self.model = model or None
+        self.max_tags = max_tags
+        self._cache_size = cache_size
+        self._force_reprocess = force_reprocess
+        # Bounded LRU of per-file tag results, keyed by path.
+        # Lets a single batch reuse the result for the same path
+        # without re-running the model. Bypassed when force_reprocess.
+        self._tag_cache: "OrderedDict[str, Tuple[List[str], Optional[str]]]" = OrderedDict()
+        self._ollama_client = None  # lazily opened, reused across files
+        self._ollama_url = None
+        self._ollama_model = None
+        # Counters (read by callers / status bars).
+        self.processed = 0
+        self.failed = 0
+        self.cached_hits = 0
+        # Backing log — appended to by _emit().
+        self.log_lines: List[str] = []
+
+    # ---------------- cache ----------------
+
+    def clear_cache(self) -> None:
+        """Drop the per-file tag cache (forces the next call to recompute)."""
+        self._tag_cache.clear()
+
+    def _cache_get(self, path: str) -> Optional[Tuple[List[str], Optional[str]]]:
+        if self._force_reprocess:
+            return None
+        v = self._tag_cache.get(path)
+        if v is not None:
+            self._tag_cache.move_to_end(path)
+            self.cached_hits += 1
+        return v
+
+    def _cache_put(self, path: str,
+                   value: Tuple[List[str], Optional[str]]) -> None:
+        self._tag_cache[path] = value
+        self._tag_cache.move_to_end(path)
+        while len(self._tag_cache) > self._cache_size:
+            self._tag_cache.popitem(last=False)
+
+    # ---------------- Ollama lifecycle ----------------
+
+    def _ensure_ollama(self):
+        """Lazily build the Ollama HTTP client. Reuses it across files
+        so we don't pay the TCP+TLS handshake per image."""
+        if self._ollama_client is not None:
+            return self._ollama_client
+        try:
+            from . import settings as _settings
+            from .ollama_client import OllamaClient
+            cfg = _settings.load_settings()
+            self._ollama_url = cfg.get("ollama_url", "http://localhost:11434")
+            self._ollama_model = self.model or cfg.get("ollama_model", "llava:7b")
+            self._ollama_client = OllamaClient(
+                base_url=self._ollama_url,
+                model=self._ollama_model,
+                timeout=int(cfg.get("ollama_timeout", 60)),
+            )
+            self._emit("ollama_init",
+                       f"Ollama client ready ({self._ollama_url}, {self._ollama_model})")
+        except Exception as e:
+            self._emit("ollama_init", f"Could not init Ollama client: {e}")
+            self._ollama_client = None
+        return self._ollama_client
+
+    def close(self) -> None:
+        """Release the Ollama HTTP client. Call when the batch is done."""
+        if self._ollama_client is not None:
+            try:
+                self._ollama_client.close()
+            except Exception:
+                pass
+            self._ollama_client = None
+
+    # ---------------- per-backend tag detection ----------------
+
+    def _ollama_detect(self, path: str) -> Tuple[List[str], Optional[str]]:
+        client = self._ensure_ollama()
+        if client is None:
+            return [], None
+        try:
+            tags = client.detect_tags(path, max_tags=self.max_tags) or []
+            subject = client.detect_main_subject(path)
+            return tags, subject
+        except Exception as e:
+            self._emit("ollama_err", f"Ollama call failed for {os.path.basename(path)}: {e}")
+            return [], None
+
+    def _clip_detect(self, path: str) -> Tuple[List[str], Optional[str]]:
+        try:
+            from .clip_client import get_engine
+            engine = get_engine(model_name=self.model)
+            if not engine.available:
+                return [], None
+            vocab = _clip_tag_vocab()
+            if not vocab:
+                return [], None
+            img_feat = engine.encode_image(path)
+            if img_feat is None:
+                return [], None
+            import torch
+            import numpy as np
+            BATCH = 128
+            sims_chunks: List["torch.Tensor"] = []
+            valid_vocab: List[str] = []
+            for i in range(0, len(vocab), BATCH):
+                chunk = vocab[i:i + BATCH]
+                chunk_feats_list = engine.encode_texts(chunk)
+                if not chunk_feats_list or any(t is None for t in chunk_feats_list):
+                    continue
+                chunk_feats = torch.stack([t for t in chunk_feats_list], dim=0)
+                chunk_sims = (
+                    img_feat.to(chunk_feats.device) @ chunk_feats.T
+                ).squeeze(0)
+                sims_chunks.append(chunk_sims.detach().cpu())
+                valid_vocab.extend(chunk)
+                del chunk_feats, chunk_sims
+            if not sims_chunks:
+                return [], None
+            sims = torch.cat(sims_chunks, dim=0)
+            scores = sims.numpy()
+            order = np.argsort(-scores)
+            top: List[str] = []
+            for idx in order[:self.max_tags]:
+                if float(scores[idx]) <= 0:
+                    break
+                top.append(valid_vocab[int(idx)])
+            del sims, scores, sims_chunks
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            return top, (top[0] if top else None)
+        except Exception as e:
+            self._emit("clip_err", f"CLIP call failed for {os.path.basename(path)}: {e}")
+            return [], None
+
+    def _heuristic_detect(self, path: str, category: Optional[str]) -> Tuple[List[str], Optional[str]]:
+        return get_tags_for_file(path, category=category, max_tags=self.max_tags)
+
+    # ---------------- single-file entry point ----------------
+
+    def detect_tags(self,
+                    path: str,
+                    category: Optional[str] = None
+                    ) -> Tuple[List[str], Optional[str]]:
+        """Detect tags for one file using this renamer's backend/model.
+
+        Returns (tags, subject) and never raises — failures yield an
+        empty list which the deterministic fallback then fills with
+        colour/aspect tokens.
+        """
+        if not path:
+            return [], None
+        if not os.path.isfile(path):
+            self._emit("missing", f"file not found: {path}")
+            self.failed += 1
+            return [], None
+        cached = self._cache_get(path)
+        if cached is not None:
+            return cached
+
+        self._emit("file_started", os.path.basename(path))
+        try:
+            backend = self.backend
+            tags: List[str] = []
+            subject: Optional[str] = None
+
+            if backend == "ollama":
+                tags, subject = self._ollama_detect(path)
+                if not tags and not subject:
+                    self._emit("fallback", "Ollama returned no tags")
+            elif backend == "clip":
+                tags, subject = self._clip_detect(path)
+                if not tags and not subject:
+                    self._emit("fallback", "CLIP returned no tags")
+            elif backend == "heuristic":
+                tags, subject = self._heuristic_detect(path, category)
+            else:  # auto — cascade Ollama → CLIP → heuristic
+                tags, subject = self._ollama_detect(path)
+                if not tags and not subject:
+                    self._emit("auto_fallback", "Ollama failed, trying CLIP")
+                    tags, subject = self._clip_detect(path)
+                if not tags and not subject:
+                    self._emit("auto_fallback", "CLIP failed, using heuristic")
+                    tags, subject = self._heuristic_detect(path, category)
+
+            # Always wrap with deterministic fallback so the result
+            # is never empty — augments AI tags with colour/aspect tokens.
+            result = _fallback_tags(path, tags, max_tags=self.max_tags), subject
+            self._cache_put(path, result)
+            self.processed += 1
+            self._emit("file_done", f"{os.path.basename(path)} → {result[0]}")
+            return result
+        except Exception as e:
+            # One bad file must not break the batch.
+            self.failed += 1
+            self._emit("file_failed",
+                       f"{os.path.basename(path)}: {type(e).__name__}: {e}")
+            return [], None
+
+    # ---------------- batch entry point ----------------
+
+    def detect_tags_batch(self,
+                          files: List[str],
+                          category: Optional[str] = None
+                          ) -> Dict[str, Tuple[List[str], Optional[str]]]:
+        """Run ``detect_tags`` on every file. Returns a dict path → result.
+
+        Per-file errors are isolated: a failing file yields ``[]`` and
+        increments ``self.failed``. The batch never aborts early.
+        """
+        out: Dict[str, Tuple[List[str], Optional[str]]] = {}
+        total = len(files)
+        for i, p in enumerate(files, 1):
+            self._emit("progress", f"file {i}/{total}: {os.path.basename(p)}")
+            out[p] = self.detect_tags(p, category=category)
+        self._emit("batch_done",
+                   f"processed={self.processed} cached={self.cached_hits} "
+                   f"failed={self.failed}")
+        return out
+
+    # ---------------- logging ----------------
+
+    def _emit(self, stage: str, msg: str) -> None:
+        line = f"[{stage}] {msg}"
+        self.log_lines.append(line)
+        # Also forward to the optional global progress_cb so legacy
+        # callers keep working without modification.
+        cb = globals().get("_AIRENAMER_GLOBAL_CB")
+        if cb:
+            try:
+                cb(stage, msg)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Standalone function wrappers (kept for backwards compatibility)
+# ---------------------------------------------------------------------------
 
 
 def ai_detect_tags(
@@ -708,80 +912,21 @@ def ai_detect_tags(
     model: Optional[str] = None,
     progress_cb=None,
 ) -> Tuple[List[str], Optional[str]]:
-    """Detect descriptive tags using the requested AI backend.
+    """Single-file AI tag detection (uses a temporary AIRenamer).
 
-    Args:
-        image_path: absolute path to the image.
-        backend: one of ``AI_TAG_BACKENDS``.
-            * ``auto``       — try Ollama, then CLIP, then heuristic.
-            * ``ollama``     — force the local Ollama vision model.
-            * ``clip``       — force the local OpenAI CLIP model.
-            * ``heuristic``  — pure CV pipeline (no AI).
-        category: optional category hint used by the heuristic fallback
-            and surfaced in logs.
-        max_tags: cap on the returned tag list.
-        model: optional explicit model name (overrides the configured
-            active model). ``None`` falls back to whatever's in settings.
-        progress_cb: optional ``callable(stage, msg)`` for status updates.
-
-    Returns:
-        ``(tags, subject)``. Both can be empty/None on failure.
+    New code should construct an AIRenamer directly so the Ollama
+    HTTP client and per-file cache are reused across the batch.
     """
-    if backend not in AI_TAG_BACKENDS:
-        # Unknown backend — fall back to heuristic rather than "auto",
-        # because "auto" would attempt to reach Ollama/CLIP first and
-        # could hang on connection timeouts.
-        backend = "heuristic"
-
-    def _emit(stage, msg):
-        if progress_cb:
-            try:
-                progress_cb(stage, msg)
-            except Exception:
-                pass
-
-    if backend == "ollama":
-        _emit("ollama", f"Querying Ollama ({model or 'configured'}) for {os.path.basename(image_path)}")
-        tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags,
-                                         category=category, model=model)
-        if tags or subj:
-            return _fallback_tags(image_path, tags, max_tags=max_tags), subj
-        _emit("fallback", "Ollama returned no tags, using deterministic fallback")
-        return _fallback_tags(image_path, [], max_tags=max_tags), None
-
-    if backend == "clip":
-        _emit("clip", f"Scoring CLIP ({model or 'configured'}) tag vocabulary for {os.path.basename(image_path)}")
-        tags, subj = _clip_detect_tags(image_path, max_tags=max_tags,
-                                      category=category, model=model)
-        if tags or subj:
-            return _fallback_tags(image_path, tags, max_tags=max_tags), subj
-        _emit("fallback", "CLIP returned no tags, using deterministic fallback")
-        return _fallback_tags(image_path, [], max_tags=max_tags), None
-
-    if backend == "heuristic":
-        _emit("heuristic", f"Running heuristic tagger on {os.path.basename(image_path)}")
-        return _fallback_tags(
-            image_path,
-            get_tags_for_file(image_path, category=category, max_tags=max_tags),
-            max_tags=max_tags,
-        ), None
-
-    # auto: try Ollama → CLIP → heuristic → deterministic fallback.
-    _emit("auto", f"Auto-detecting tags for {os.path.basename(image_path)}")
-    tags, subj = _ollama_detect_tags(image_path, max_tags=max_tags,
-                                     category=category, model=model)
-    if tags or subj:
-        return _fallback_tags(image_path, tags, max_tags=max_tags), subj
-    tags, subj = _clip_detect_tags(image_path, max_tags=max_tags,
-                                  category=category, model=model)
-    if tags or subj:
-        return _fallback_tags(image_path, tags, max_tags=max_tags), subj
-    _emit("fallback", "All AI backends returned no tags, using deterministic fallback")
-    return _fallback_tags(
-        image_path,
-        get_tags_for_file(image_path, category=category, max_tags=max_tags),
-        max_tags=max_tags,
-    ), None
+    global _AIRENAMER_GLOBAL_CB
+    _AIRENAMER_GLOBAL_CB = progress_cb
+    try:
+        ren = AIRenamer(backend=backend, model=model, max_tags=max_tags)
+        try:
+            return ren.detect_tags(image_path, category=category)
+        finally:
+            ren.close()
+    finally:
+        _AIRENAMER_GLOBAL_CB = None
 
 
 def ai_compute_renames(
@@ -795,41 +940,56 @@ def ai_compute_renames(
     truncate_len: int = 32,
     model: Optional[str] = None,
     progress_cb=None,
+    force_reprocess: bool = False,
 ) -> List[Tuple[str, str]]:
     """Build rename pairs using AI-detected tags.
 
-    Like ``compute_renames`` but uses ``ai_detect_tags`` (CLIP / Ollama)
-    for tag-based strategies. For non-tag strategies the result is
-    identical to ``build_renames``.
+    Constructs a single AIRenamer for the batch so the Ollama HTTP
+    client and per-file cache are reused. For non-tag strategies the
+    result is identical to ``build_renames``.
 
-    `model` overrides the configured active model for both CLIP and
-    Ollama backends. Pass ``None`` to use whatever's in settings.
+    Args:
+        ... (see AIRenamer for the rest)
+        force_reprocess: bypass the per-file cache and re-detect every
+            image even if it was already processed in this batch.
     """
     needs_tags = strategy in TAG_BASED_STRATEGIES
-    tags_by_file: Dict[str, List[str]] = {}
-    subject_by_file: Dict[str, Optional[str]] = {}
-    if needs_tags:
+    if not needs_tags:
+        return build_renames(
+            files, strategy=strategy, category=category or "",
+            start=start, pad=pad, truncate_len=truncate_len,
+        )
+
+    ren = AIRenamer(
+        backend=backend, model=model, max_tags=max_tags,
+        force_reprocess=force_reprocess,
+    )
+    try:
+        tags_by_file: Dict[str, List[str]] = {}
+        subject_by_file: Dict[str, Optional[str]] = {}
         total = len(files)
         for i, p in enumerate(files, 1):
-            tags, subject = ai_detect_tags(
-                p, backend=backend, category=category, max_tags=max_tags,
-                model=model, progress_cb=progress_cb,
-            )
+            tags, subject = ren.detect_tags(p, category=category)
             tags_by_file[p] = tags
             subject_by_file[p] = subject
-            if progress_cb and (i % 5 == 0 or i == total):
+            if progress_cb:
                 try:
-                    progress_cb("progress", i, total)
+                    progress_cb("progress", i, total, p)
                 except Exception:
                     pass
-    return build_renames(
-        files,
-        strategy=strategy,
-        category=category or "",
-        start=start,
-        pad=pad,
-        truncate_len=truncate_len,
-        tags_by_file=tags_by_file,
-        subject_by_file=subject_by_file,
-        max_tags=max_tags,
-    )
+        # Surface the renamer log to the global callback too.
+        if progress_cb:
+            for line in ren.log_lines:
+                try:
+                    progress_cb("log", line)
+                except Exception:
+                    pass
+        return build_renames(
+            files, strategy=strategy, category=category or "",
+            start=start, pad=pad, truncate_len=truncate_len,
+            tags_by_file=tags_by_file,
+            subject_by_file=subject_by_file,
+            max_tags=max_tags,
+        )
+    finally:
+        ren.close()
