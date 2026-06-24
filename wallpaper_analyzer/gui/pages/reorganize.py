@@ -29,14 +29,16 @@ from PySide6.QtWidgets import (
     QSplitter, QListWidget, QListWidgetItem, QMenu, QMessageBox,
     QSlider, QWidget, QCheckBox, QDialog,
     QLineEdit, QComboBox, QProgressBar, QAbstractItemView,
+    QSpinBox, QGroupBox, QFormLayout,
 )
 from PySide6.QtCore import Qt, QTimer, QSize, QThread, Signal, QMimeData
-from PySide6.QtGui import QPixmap, QImage, QIcon, QPainter, QColor, QFont
+from PySide6.QtGui import QPixmap, QImage, QIcon, QPainter, QColor, QFont, QPen
 
 from ... import settings as s
 from ... import formats as f
 from ... import categories as c
 from ...category_config import aspect_ratio_class, get_expected
+from ...rename import RENAME_STRATEGIES, TAG_BASED_STRATEGIES, compute_renames, apply_renames
 
 VIDEO_EXTS = {".mp4", ".m4v", ".webm", ".mkv", ".avi", ".mov", ".flv",
               ".mpg", ".mpeg", ".mpe", ".mpv", ".ogv", ".wmv", ".asf",
@@ -87,7 +89,12 @@ def _video_thumb(src, size):
 
 
 def _make_pixmap(source, size):
-    """Generate a QPixmap thumbnail from any media file path.
+    """Generate a thumbnail QPixmap from any media file path.
+
+    Always returns a *square* QPixmap of exactly ``size x size`` so the
+    grid renders with consistent proportions regardless of source aspect
+    ratio. Non-square sources are letterboxed on a neutral dark background
+    rather than stretched or scaled non-uniformly.
 
     Handles images, animated GIFs (first frame), videos (ffmpeg frame),
     and formats requiring plugins (RAW, PSD, AVIF, HEIC, etc.).
@@ -95,9 +102,14 @@ def _make_pixmap(source, size):
     """
     ftype = _file_type(source)
     img = None
+    err = None
 
     if ftype == "video":
         img = _video_thumb(source, size)
+        if img is None and not _has_ffmpeg():
+            err = "no ffmpeg"
+        elif img is None:
+            err = "ffmpeg failed"
 
     if img is None:
         try:
@@ -107,23 +119,74 @@ def _make_pixmap(source, size):
             pil_img = ImageOps.exif_transpose(pil_img)
             pil_img = pil_img.convert("RGB")
             img = pil_img
-        except Exception:
-            if ftype == "video":
-                return None, "no ffmpeg"
-            return None, "format error"
+        except Exception as exc:
+            err = err or "format error"
+
+    if img is None:
+        # Always return a square placeholder of the requested size so the
+        # grid stays aligned. Caller decides how to render the error
+        # overlay (see ``_error_icon``).
+        return _error_pixmap(size, err or "error"), ftype
 
     try:
+        # Downscale preserving aspect ratio (never upscale).
         img.thumbnail((size, size), Image.LANCZOS)
-        w, h = img.size
-        data = img.tobytes("raw", "RGB")
-        qi = QImage(data, w, h, w * 3, QImage.Format.Format_RGB888)
-        pix = QPixmap.fromImage(qi).scaled(
-            size, size, Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        iw, ih = img.size
+
+        # Compose onto a square canvas so the QPixmap is exactly size×size.
+        canvas = Image.new("RGB", (size, size), (10, 10, 10))
+        ox = (size - iw) // 2
+        oy = (size - ih) // 2
+        canvas.paste(img, (ox, oy))
+
+        data = canvas.tobytes("raw", "RGB")
+        qi = QImage(data, size, size, size * 3, QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(qi)
         return pix, ftype
     except Exception as e:
-        return None, str(e)
+        return _error_pixmap(size, str(e)), ftype
+
+
+def _error_pixmap(size, msg):
+    """Square placeholder used when thumbnail generation fails.
+
+    Renders a darker red-tinted square with an exclamation glyph so the
+    user can spot broken files at a glance instead of guessing whether a
+    dark square is 'loading' or 'broken'.
+    """
+    pix = QPixmap(size, size)
+    pix.fill(QColor("#1a0808"))
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    # Inset border
+    p.setPen(QColor("#7a1f1f"))
+    p.drawRect(0, 0, size - 1, size - 1)
+    # Diagonal hatch lines so a black video doesn't camouflage
+    pen = QPen(QColor("#3a1010"))
+    pen.setWidth(1)
+    p.setPen(pen)
+    for x in range(-size, size * 2, 8):
+        p.drawLine(x, 0, x + size, size)
+    # Centered error glyph
+    font = QFont()
+    font.setBold(True)
+    font.setPixelSize(max(14, size // 4))
+    p.setFont(font)
+    p.setPen(QColor("#e04040"))
+    p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "!")
+    # Tag below glyph (small, optional)
+    if msg and size >= 80:
+        small = QFont()
+        small.setPixelSize(max(8, size // 10))
+        p.setFont(small)
+        p.setPen(QColor("#7a1f1f"))
+        p.drawText(
+            pix.rect().adjusted(0, size // 3, 0, 0),
+            Qt.AlignmentFlag.AlignCenter,
+            (msg or "error")[:8],
+        )
+    p.end()
+    return pix
 
 
 def _draw_badge(pix, label, color):
@@ -243,14 +306,18 @@ class ThumbWorker(QThread):
                 continue
             try:
                 pix, ftype = _make_pixmap(path, size)
-                if pix is not None:
+                # _make_pixmap always returns a pixmap (error pixmap on failure)
+                # but we still guard against None in case of catastrophic
+                # failure (out-of-memory, etc.).
+                if pix is None:
+                    self.icon_ready.emit(path, size, token, None)
+                    continue
+                if ftype != "image":
                     pix = _draw_badge(
                         pix, ftype,
                         "#ff0000" if ftype == "video" else "#cc6600",
                     )
-                    self.icon_ready.emit(path, size, token, QIcon(pix))
-                else:
-                    self.icon_ready.emit(path, size, token, None)
+                self.icon_ready.emit(path, size, token, QIcon(pix))
             except Exception:
                 self.icon_ready.emit(path, size, token, None)
 
@@ -258,6 +325,103 @@ class ThumbWorker(QThread):
 # ---------------------------------------------------------------------------
 # Drag-and-drop helpers
 # ---------------------------------------------------------------------------
+
+
+class _RenameJob(QThread):
+    """Background worker: compute rename pairs and apply them.
+
+    For tag-based strategies, tags are detected per file (cached). For move
+    jobs, files are first copied to the target directory then renamed to
+    keep the destination's existing index pattern intact.
+
+    Signals:
+        progress(int, int)  - (done, total)
+        finished_ok(dict)   - {'pairs': [...], 'renamed': n, 'errors': n, ...}
+        failed(str)         - error message
+    """
+    progress = Signal(int, int)
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, paths, target_dir, strategy, category, max_tags):
+        super().__init__()
+        self.paths = list(paths)
+        self.target_dir = target_dir  # None for in-place rename
+        self.strategy = strategy
+        self.category = category or ""
+        self.max_tags = max_tags
+
+    def run(self):
+        try:
+            from ... import rename as _rename
+            # Build pairs in chunks so we can emit progress for big batches.
+            tags_by_file = {}
+            subject_by_file = {}
+            if self.strategy in _rename.TAG_BASED_STRATEGIES:
+                total = len(self.paths)
+                for i, p in enumerate(self.paths, 1):
+                    tags, subject = _rename.get_tags_for_file(
+                        p, category=self.category, max_tags=self.max_tags,
+                    )
+                    tags_by_file[p] = tags
+                    subject_by_file[p] = subject
+                    if i % 5 == 0 or i == total:
+                        self.progress.emit(i, total)
+
+            pairs = _rename.build_renames(
+                self.paths,
+                strategy=self.strategy,
+                category=self.category,
+                max_tags=self.max_tags,
+                tags_by_file=tags_by_file,
+                subject_by_file=subject_by_file,
+            )
+
+            moved = 0
+            renamed = 0
+            errors: List[str] = []
+            # If target_dir is given, the new filename is computed against the
+            # SOURCE directory by build_renames; relocate it to target_dir.
+            final_pairs = []
+            for old, new in pairs:
+                if self.target_dir:
+                    new = os.path.join(self.target_dir, os.path.basename(new))
+                final_pairs.append((old, new))
+
+            for i, (old, new) in enumerate(final_pairs, 1):
+                try:
+                    if old == new:
+                        continue
+                    os.makedirs(os.path.dirname(new), exist_ok=True)
+                    if os.path.exists(new):
+                        base, ext = os.path.splitext(new)
+                        counter = 1
+                        candidate = f"{base}_{counter}{ext}"
+                        while os.path.exists(candidate):
+                            counter += 1
+                            candidate = f"{base}_{counter}{ext}"
+                        new = candidate
+                    if os.path.dirname(old) != os.path.dirname(new):
+                        shutil.move(old, new)
+                        moved += 1
+                    else:
+                        os.rename(old, new)
+                    renamed += 1
+                    if i % 10 == 0 or i == len(final_pairs):
+                        self.progress.emit(i, len(final_pairs))
+                except Exception as e:
+                    errors.append(f"{os.path.basename(old)}: {e}")
+            self.finished_ok.emit({
+                "pairs": final_pairs,
+                "renamed": renamed,
+                "moved": moved,
+                "errors": len(errors),
+                "error_list": errors[:10],
+                "strategy": self.strategy,
+            })
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
 
 class DragGridList(QListWidget):
     """Grid that exports dragged items as a custom MIME with file paths."""
@@ -451,13 +615,30 @@ class ReorganizePage(QWidget):
 
         self.cb_rename = QCheckBox("Rename on move")
         self.cb_rename.setChecked(True)
+        self.cb_rename.setToolTip(
+            "When moving files, also rename them according to the "
+            "Strategy and Max tags settings below."
+        )
         hl.addWidget(self.cb_rename)
 
-        self.btn_rename = QPushButton("Rename...")
+        self.btn_rename = QPushButton("Rename dialog...")
         self.btn_rename.setObjectName("primary")
+        self.btn_rename.setToolTip(
+            "Open the full Rename dialog (preview, dry-run, batch options)."
+        )
         self.btn_rename.clicked.connect(self._on_rename)
         self.btn_rename.setEnabled(False)
         hl.addWidget(self.btn_rename)
+
+        self.btn_rename_only = QPushButton("Rename only")
+        self.btn_rename_only.setObjectName("success")
+        self.btn_rename_only.setToolTip(
+            "Rename currently visible/selected files in place — "
+            "without moving them — using the Strategy below."
+        )
+        self.btn_rename_only.clicked.connect(self._on_rename_only)
+        self.btn_rename_only.setEnabled(False)
+        hl.addWidget(self.btn_rename_only)
 
         self.btn_dupes = QPushButton("Find Duplicates")
         self.btn_dupes.setObjectName("ghost")
@@ -474,6 +655,61 @@ class ReorganizePage(QWidget):
         self.btn_open_dest.setToolTip("Open the destination folder in the system file manager.")
         self.btn_open_dest.clicked.connect(self._open_destination)
         hl.addWidget(self.btn_open_dest)
+
+        l.addWidget(hdr)
+
+        # ----- Rename options row -----
+        rn = QFrame()
+        rn.setObjectName("card")
+        rn.setStyleSheet(
+            "QFrame#card { background: #080808; border: none;"
+            " border-bottom: 1px solid #1a1a1a; border-radius: 0;"
+            " padding: 0px; }"
+        )
+        rnl = QHBoxLayout(rn)
+        rnl.setContentsMargins(24, 4, 24, 8)
+        rnl.setSpacing(10)
+
+        rnl.addWidget(QLabel("Strategy:"))
+        self._rename_strat = QComboBox()
+        self._rename_strat.setMinimumWidth(220)
+        for key, label, desc in RENAME_STRATEGIES:
+            self._rename_strat.addItem(f"{label}  —  {desc}", key)
+        self._rename_strat.setCurrentIndex(1)  # default to "By category"
+        self._rename_strat.setToolTip(
+            "How files are named when 'Rename on move' is enabled "
+            "or when using the 'Rename only' button. Tag-based strategies "
+            "auto-detect content using the heuristic CV pipeline."
+        )
+        self._rename_strat.currentIndexChanged.connect(self._on_rename_strat_changed)
+        rnl.addWidget(self._rename_strat)
+
+        self._cb_rename_prefix = QCheckBox("Use category as prefix")
+        self._cb_rename_prefix.setChecked(True)
+        self._cb_rename_prefix.setToolTip(
+            "For the 'category' strategy: prefix the category name to the "
+            "new filename (e.g. Anime_001.jpg)."
+        )
+        rnl.addWidget(self._cb_rename_prefix)
+
+        rnl.addWidget(QLabel("Max tags:"))
+        self._max_tags = QSpinBox()
+        self._max_tags.setRange(1, 8)
+        self._max_tags.setValue(3)
+        self._max_tags.setToolTip(
+            "How many content tags to embed in the filename for tag-based "
+            "strategies. More tags = longer filenames."
+        )
+        self._max_tags.valueChanged.connect(lambda _v: self._refresh_rename_buttons())
+        rnl.addWidget(self._max_tags)
+
+        self._rename_strategy_hint = QLabel("")
+        self._rename_strategy_hint.setObjectName("statSmall")
+        self._rename_strategy_hint.setStyleSheet("color: #777;")
+        rnl.addWidget(self._rename_strategy_hint, 1)
+
+        self._on_rename_strat_changed()
+        l.addWidget(rn)
 
         l.addWidget(hdr)
 
@@ -876,7 +1112,7 @@ class ReorganizePage(QWidget):
         self._all_files = files
         self._apply_filter_sort()
         self._update_stats()
-        self.btn_rename.setEnabled(len(self._all_files) > 0)
+        self._refresh_rename_buttons()
         self._status.setText(
             f"Loaded {len(self._all_files)} files"
             + (f"  -  {len(self._visible)} shown" if len(self._visible) != len(self._all_files) else "")
@@ -1096,50 +1332,49 @@ class ReorganizePage(QWidget):
             self._show_preview(path, fname, cat)
 
     def _show_preview(self, path, fname, cat):
+        """Render the right-hand preview pane.
+
+        Uses the same square-canvas composer as the grid so the preview
+        matches the cell aspect ratio (no stretching or scrollbars).
+        """
         ftype = _file_type(path)
         fsz = os.path.getsize(path)
         ext = os.path.splitext(fname)[1].lower()
 
-        if ftype == "video":
-            pix, _ = _make_pixmap(path, 380)
-            if pix is None:
-                self._prev_label.setText("Video (no ffmpeg)")
-                self._prev_info.setText(f"Name: {fname}\nType: VIDEO\nCategory: {cat}")
-            else:
-                self._prev_label.setPixmap(pix)
-                self._prev_label.setMinimumHeight(pix.height())
-                self._prev_info.setText(f"Name: {fname}\nType: VIDEO ({ext})\nCategory: {cat}\nSize: {_human_size(fsz)}")
+        # Render at 480 px so the preview pane has a clean aspect ratio
+        # without overflowing typical layouts.
+        pix, _ = _make_pixmap(path, 480)
+        if pix is None:
+            self._prev_label.setText("Cannot preview")
+            self._prev_info.setText(
+                f"Name: {fname}\nType: {ftype.upper()} ({ext})\nCategory: {cat}"
+            )
+            self._status.setText(f"Selected: {fname}")
             return
 
+        # For videos we already know it failed; show the inline error icon.
+        animated = (ftype == "animated") or (ext in ANIM_EXTS)
+        info_lines = [
+            f"Name: {fname}",
+            f"Type: {('ANIMATED' if animated else ftype.upper())} ({ext})",
+        ]
+        # Try to recover real dimensions for the info panel.
         try:
-            img = Image.open(path)
-            animated = getattr(img, "is_animated", False) or getattr(img, "n_frames", 1) > 1
-            img = ImageOps.exif_transpose(img)
-            img = img.convert("RGB")
-            w, h = img.size
-            pw = min(w, 380)
-            ph = int(h * (pw / w))
-            img.thumbnail((pw, ph), Image.LANCZOS)
-            data = img.tobytes("raw", "RGB")
-            qi = QImage(data, img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
-            pix = QPixmap.fromImage(qi)
-            self._prev_label.setPixmap(pix)
-            self._prev_label.setMinimumHeight(ph)
+            with Image.open(path) as im:
+                real_w, real_h = im.size
+        except Exception:
+            real_w = real_h = 0
+        if real_w and real_h:
+            info_lines.append(f"Dimensions: {real_w}x{real_h}")
+        info_lines.append(f"Size: {_human_size(fsz)}")
+        info_lines.append(f"Category: {cat or '—'}")
 
-            type_label = "ANIMATED" if (animated and ext in ANIM_EXTS) else ftype.upper()
-            info_lines = [
-                f"Name: {fname}",
-                f"Type: {type_label} ({ext})",
-                f"Dimensions: {w}x{h}",
-                f"Size: {_human_size(fsz)}",
-                f"Category: {cat}",
-            ]
-            self._prev_info.setText("\n".join(info_lines))
-
-            self._status.setText(f"Selected: {fname}  [{w}x{h}]")
-        except Exception as e:
-            self._prev_label.setText(f"Cannot preview:\n{str(e)[:80]}")
-            self._prev_info.setText(f"Name: {fname}\nType: {ftype.upper()} ({ext})\nCategory: {cat}")
+        self._prev_label.setPixmap(pix)
+        self._prev_info.setText("\n".join(info_lines))
+        if real_w and real_h:
+            self._status.setText(f"Selected: {fname}  [{real_w}x{real_h}]")
+        else:
+            self._status.setText(f"Selected: {fname}")
 
     # ------------------------ CONTEXT MENU / MOVE / DELETE ------------------------
 
@@ -1221,6 +1456,38 @@ class ReorganizePage(QWidget):
         dst_dir = os.path.join(dest, target_cat)
         os.makedirs(dst_dir, exist_ok=True)
         rename_on_move = self.cb_rename.isChecked()
+        strategy = self._rename_strat.currentData() or "sequential"
+
+        # If rename-on-move is disabled, do the move with collision-safe names.
+        if not rename_on_move or strategy == "none":
+            self._move_keep_names(paths, target_cat, dst_dir)
+            return
+
+        # Otherwise: build pairs (move + rename) using the chosen strategy.
+        # Category hint for tag boosting:
+        cat_hint = target_cat if self._cb_rename_prefix.isEnabled() else ""
+        # Filter out files already in the target category.
+        filtered = [p for p in paths if p and os.path.isfile(p)
+                    and self._category_for(p) != target_cat]
+        if not filtered:
+            self._status.setText("Nothing to move (already in target category)")
+            return
+
+        self._set_busy(True, f"Moving + renaming {len(filtered)} files -> {target_cat}...")
+        self._run_rename_job(
+            paths=filtered,
+            target_dir=dst_dir,
+            strategy=strategy,
+            category=cat_hint or target_cat,
+            max_tags=self._max_tags.value(),
+            mode="move",
+        )
+        # Stash the destination category so _on_rename_done can adjust counts.
+        self._pending_move_target = target_cat
+        self._pending_move_src_cats = {p: self._category_for(p) for p in filtered}
+
+    def _move_keep_names(self, paths, target_cat, dst_dir):
+        """Move files to dst_dir keeping their original names (collision-safe)."""
         moved = 0
         skipped = 0
         for src in paths:
@@ -1234,24 +1501,12 @@ class ReorganizePage(QWidget):
             fname = os.path.basename(src)
             ext = os.path.splitext(fname)[1]
             try:
-                if rename_on_move:
-                    n = 1
-                    while True:
-                        nn = f"{target_cat}_{n:03d}{ext}"
-                        if not os.path.exists(os.path.join(dst_dir, nn)):
-                            break
-                        n += 1
-                        if n > 9999:
-                            nn = f"{target_cat}_{os.getpid()}_{moved}{ext}"
-                            break
-                    dst = os.path.join(dst_dir, nn)
-                else:
-                    dst = os.path.join(dst_dir, fname)
-                    n = 1
-                    while os.path.exists(dst):
-                        base = os.path.splitext(fname)[0]
-                        dst = os.path.join(dst_dir, f"{base}_{n}{ext}")
-                        n += 1
+                dst = os.path.join(dst_dir, fname)
+                n = 1
+                while os.path.exists(dst):
+                    base = os.path.splitext(fname)[0]
+                    dst = os.path.join(dst_dir, f"{base}_{n}{ext}")
+                    n += 1
                 shutil.move(src, dst)
                 self._undo_stack.append((src, dst))
                 self._update_cat_count(cur_cat, -1, total_delta=0)
@@ -1261,7 +1516,6 @@ class ReorganizePage(QWidget):
                 QMessageBox.warning(self, "Move failed", f"{fname}: {e}")
                 skipped += 1
 
-        # Remove the moved items from the grid (and from _all_files).
         self._remove_paths_from_view(set(p for p in paths if p))
         self._update_undo_label()
         msg = f"Moved {moved} file{'s' if moved != 1 else ''} -> {target_cat}"
@@ -1397,12 +1651,177 @@ class ReorganizePage(QWidget):
         if not files:
             return
         from ..rename_dialog import RenameDialog
-        dlg = RenameDialog(files, category=self._cur_cat, parent=self)
+        strategy = self._rename_strat.currentData() or "sequential"
+        dlg = RenameDialog(
+            files,
+            category=self._cur_cat,
+            parent=self,
+            default_strategy=strategy,
+            max_tags=self._max_tags.value(),
+        )
         if dlg.exec() == QDialog.Accepted:
             self._status.setText("Rename complete")
             self._refresh()
         else:
             self._status.setText("Rename cancelled")
+
+    def _on_rename_strat_changed(self):
+        """Show strategy hint and toggle controls."""
+        strat = self._rename_strat.currentData() or ""
+        is_tag = strat in TAG_BASED_STRATEGIES
+        self._cb_rename_prefix.setEnabled(strat == "category" or is_tag)
+        if is_tag:
+            self._rename_strategy_hint.setText(
+                "Tag-based: tags are detected from the image using the "
+                "heuristic CV pipeline (no AI). First-time use may take a few seconds."
+            )
+        elif strat == "category":
+            self._rename_strategy_hint.setText(
+                "Files are renamed to <Category>_NNN.jpg as they are moved."
+            )
+        elif strat == "sequential":
+            self._rename_strategy_hint.setText(
+                "Files are renamed to zero-padded sequential numbers in "
+                "their destination folder."
+            )
+        else:
+            self._rename_strategy_hint.setText("")
+        self._refresh_rename_buttons()
+
+    def _refresh_rename_buttons(self):
+        """Enable rename buttons only when there are visible files."""
+        has_files = bool(self._visible or self._all_files)
+        self.btn_rename.setEnabled(has_files)
+        self.btn_rename_only.setEnabled(has_files)
+
+    def _on_rename_only(self):
+        """Rename the currently visible files in place — no move.
+
+        Uses the strategy / max-tags controls in the header. Tag-based
+        strategies auto-detect tags via the heuristic CV pipeline.
+        """
+        paths = self._current_paths_for_rename()
+        if not paths:
+            return
+        strategy = self._rename_strat.currentData() or "sequential"
+        max_tags = self._max_tags.value()
+        # Use the current category (if any) for tag boosting.
+        category_hint = self._cur_cat or ""
+
+        # Compute pairs in a background thread so tag analysis doesn't
+        # freeze the UI on large selections.
+        self._set_busy(True, "Detecting tags + building new names...")
+        self._run_rename_job(
+            paths=paths,
+            target_dir=None,  # in-place
+            strategy=strategy,
+            category=category_hint,
+            max_tags=max_tags,
+            mode="rename_only",
+        )
+
+    def _current_paths_for_rename(self) -> List[str]:
+        """Return the path list the user wants to operate on.
+
+        Prefers the explicit selection in the grid; falls back to the
+        currently filtered view; finally to the full unfiltered list.
+        """
+        sel = self._grid.selectedItems() if hasattr(self, "_grid") else []
+        if sel:
+            return [it.data(Qt.ItemDataRole.UserRole) for it in sel
+                    if it.data(Qt.ItemDataRole.UserRole)]
+        if self._visible:
+            return [r[1] for r in self._visible]
+        return [r[1] for r in self._all_files]
+
+    def _run_rename_job(self, paths, target_dir, strategy, category, max_tags, mode):
+        """Compute rename pairs in a worker and apply them.
+
+        `mode` is 'rename_only' (in-place) or 'move' (move+rename).
+        """
+        if hasattr(self, "_rename_job") and self._rename_job and self._rename_job.isRunning():
+            QMessageBox.information(self, "Busy", "A rename job is already running.")
+            return
+
+        self._rename_job = _RenameJob(
+            paths=paths,
+            target_dir=target_dir,
+            strategy=strategy,
+            category=category,
+            max_tags=max_tags,
+        )
+        self._rename_job.progress.connect(self._on_rename_progress)
+        self._rename_job.finished_ok.connect(self._on_rename_done)
+        self._rename_job.failed.connect(self._on_rename_failed)
+        self._rename_job.start()
+
+    def _on_rename_progress(self, cur, total):
+        self._status.setText(f"Renaming... {cur}/{total}")
+
+    def _on_rename_done(self, result):
+        renamed = result.get("renamed", 0)
+        moved = result.get("moved", 0)
+        errors = result.get("errors", 0)
+        strategy = result.get("strategy", "")
+        self._set_busy(False)
+        target_cat = getattr(self, "_pending_move_target", None)
+        src_cats = getattr(self, "_pending_move_src_cats", {}) or {}
+        self._pending_move_target = None
+        self._pending_move_src_cats = None
+
+        # If this was a move job, update sidebar counts (one decrement per
+        # source category, one increment for the target).
+        if target_cat and moved:
+            for sc in set(src_cats.values()):
+                if sc:
+                    self._update_cat_count(sc, -1, total_delta=0)
+            self._update_cat_count(target_cat, +1, total_delta=0)
+
+        # Format status message.
+        if target_cat:
+            msg = f"Moved {moved} files -> {target_cat}"
+        else:
+            msg = f"Renamed {renamed} files"
+            if moved:
+                msg += f"  ({moved} moved across folders)"
+        if errors:
+            msg += f"  |  {errors} errors"
+        self._status.setText(msg)
+
+        try:
+            label = f"move -> {target_cat}" if target_cat else "rename-only"
+            self.main.append_log(
+                f"[Reorganize] {label} [{strategy}]: "
+                f"renamed={renamed}, moved={moved}, errors={errors}"
+            )
+        except Exception:
+            pass
+
+        # Update undo stack with all the rename pairs (so user can reverse).
+        if result.get("pairs"):
+            # Skip pairs where src and dst are identical.
+            real_pairs = [(o, n) for o, n in result["pairs"] if o != n]
+            self._undo_stack.extend(real_pairs)
+            self._update_undo_label()
+            self._remove_paths_from_view({o for o, _ in real_pairs})
+        else:
+            QTimer.singleShot(100, self._populate)
+
+    def _on_rename_failed(self, msg):
+        QMessageBox.warning(self, "Rename failed", msg)
+        self._status.setText("Rename failed")
+
+    def _set_busy(self, busy: bool, message: str = ""):
+        """Toggle the rename controls while a rename job is running."""
+        self.cb_rename.setEnabled(not busy)
+        self._rename_strat.setEnabled(not busy)
+        self._max_tags.setEnabled(not busy)
+        self.btn_rename_only.setEnabled(not busy and bool(self._all_files))
+        self.btn_rename.setEnabled(not busy and bool(self._all_files))
+        if busy and message:
+            self._status.setText(message)
+        elif not busy:
+            self._status.setText("Ready")
 
     def _on_find_duplicates(self):
         """Switch to the Duplicates page to scan for duplicates."""

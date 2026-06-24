@@ -305,3 +305,126 @@ RENAME_STRATEGIES = [
 
 # Strategies that need per-file tag info from the caller.
 TAG_BASED_STRATEGIES = {"tags", "category_tags", "subject_tags", "date_tags"}
+
+
+# ---------------------------------------------------------------------------
+# Per-file tag detection (used by rename dialog + reorganize "rename on move")
+# ---------------------------------------------------------------------------
+
+_PROFILE_TAGS_CACHE: Dict[str, Tuple[float, int, Tuple[List[str], Optional[str]]]] = {}
+
+
+def _profile_cache_key(path: str) -> Tuple[str, float, int]:
+    try:
+        st = os.stat(path)
+        return path, st.st_mtime, st.st_size
+    except OSError:
+        return path, 0.0, 0
+
+
+def get_tags_for_file(
+    path: str,
+    category: Optional[str] = None,
+    max_tags: int = 8,
+    use_cache: bool = True,
+) -> Tuple[List[str], Optional[str]]:
+    """Compute (tags, subject) for a single file using the heuristic CV pipeline.
+
+    Pure local CPU work; no AI/Ollama calls. Results are cached in-memory by
+    (path, mtime, size) so successive Rename-dialog or "rename on move" calls
+    reuse previous results and stay fast on large libraries.
+
+    Args:
+        path: absolute path to a supported image file.
+        category: target category name (boosts tags that match the category).
+        max_tags: cap on the returned tag list.
+        use_cache: set to False to force a fresh recomputation.
+
+    Returns:
+        (tags, subject). `subject` is the strongest heuristic main-subject
+        hint, or None when none could be inferred. Always returns a list —
+        if all detectors fail, falls back to top-3 dominant color names.
+    """
+    if not path or not os.path.isfile(path):
+        return [], None
+
+    key = _profile_cache_key(path)
+    if use_cache and key in _PROFILE_TAGS_CACHE:
+        cached_mtime, cached_size, cached_result = _PROFILE_TAGS_CACHE[key]
+        if cached_mtime == key[1] and cached_size == key[2]:
+            return cached_result
+
+    tags: List[str] = []
+    subject: Optional[str] = None
+    try:
+        from .profile import get_image_profile
+        profile = get_image_profile(path)
+        from .tag_suggester import suggest_tags_for_category
+        cat = category or profile.get("_current_category") or "default"
+        guessed = suggest_tags_for_category(cat, profile, max_tags=max_tags)
+        if guessed:
+            tags = list(guessed)[:max_tags]
+        # Best-effort main subject: the most "informative" (rarest) tag
+        if tags:
+            subject = tags[0]
+    except Exception:
+        pass
+
+    if not tags:
+        # Fallback: re-derive from a minimal profile scan (color weights only).
+        try:
+            from PIL import Image
+            from .profile import extract_color_weights
+            img = Image.open(path).convert("RGB")
+            img.thumbnail((128, 128), Image.LANCZOS)
+            weights, _ = extract_color_weights(img)
+            tags = [k.lower() for k, _ in
+                    sorted(weights.items(), key=lambda kv: -kv[1])[:3]]
+        except Exception:
+            tags = []
+
+    result = (tags, subject)
+    if use_cache:
+        _PROFILE_TAGS_CACHE[key] = (key[1], key[2], result)
+    return result
+
+
+def compute_renames(
+    files: List[str],
+    strategy: str,
+    category: Optional[str] = None,
+    max_tags: int = 3,
+    pad: int = 3,
+    start: int = 1,
+    truncate_len: int = 32,
+) -> List[Tuple[str, str]]:
+    """Build rename pairs, automatically detecting tags for tag-based strategies.
+
+    Convenience wrapper around `build_renames` that pre-computes tags and
+    subjects via `get_tags_for_file` only when the chosen strategy needs
+    them. For non-tag strategies, behaviour is identical to `build_renames`.
+    """
+    needs_tags = strategy in TAG_BASED_STRATEGIES
+    tags_by_file: Dict[str, List[str]] = {}
+    subject_by_file: Dict[str, Optional[str]] = {}
+    if needs_tags:
+        for p in files:
+            tags, subject = get_tags_for_file(p, category=category, max_tags=max_tags)
+            tags_by_file[p] = tags
+            subject_by_file[p] = subject
+    return build_renames(
+        files,
+        strategy=strategy,
+        category=category or "",
+        start=start,
+        pad=pad,
+        truncate_len=truncate_len,
+        tags_by_file=tags_by_file,
+        subject_by_file=subject_by_file,
+        max_tags=max_tags,
+    )
+
+
+def clear_tags_cache() -> None:
+    """Drop the in-memory profile/tags cache."""
+    _PROFILE_TAGS_CACHE.clear()

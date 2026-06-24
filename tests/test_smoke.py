@@ -1,5 +1,6 @@
 """Smoke tests for the package public surface."""
 import importlib
+import os
 
 import pytest
 
@@ -203,3 +204,77 @@ def test_light_theme_supported_in_apply_theme():
 
     assert callable(apply_theme)
     assert isinstance(LIGHT_QSS, str) and len(LIGHT_QSS) > 0
+
+
+def test_rename_compute_renames_sequential(tmp_path):
+    from wallpaper_analyzer.rename import compute_renames
+    fa = tmp_path / "a.jpg"
+    fb = tmp_path / "b.jpg"
+    fa.write_bytes(b"x")
+    fb.write_bytes(b"x")
+    pairs = compute_renames([str(fa), str(fb)], strategy="sequential",
+                            category="Anime", pad=3)
+    assert len(pairs) == 2
+    new_names = sorted(os.path.basename(n) for _, n in pairs)
+    assert new_names == ["001.jpg", "002.jpg"]
+
+
+def test_rename_compute_renames_no_tags_needed(tmp_path):
+    """Non-tag strategies should not call into the profile/tag pipeline."""
+    from wallpaper_analyzer.rename import compute_renames
+    fa = tmp_path / "a.jpg"
+    fa.write_bytes(b"x")
+    pairs = compute_renames([str(fa)], strategy="category",
+                            category="Anime")
+    assert len(pairs) == 1
+    _, dst = pairs[0]
+    assert os.path.basename(dst).startswith("Anime_")
+    assert dst.endswith(".jpg")
+
+
+def test_rename_get_tags_for_file_missing():
+    from wallpaper_analyzer.rename import get_tags_for_file
+    tags, subj = get_tags_for_file("/this/path/does/not/exist.jpg")
+    assert tags == []
+    assert subj is None
+
+
+def test_rename_clear_tags_cache():
+    from wallpaper_analyzer.rename import clear_tags_cache, _PROFILE_TAGS_CACHE
+    _PROFILE_TAGS_CACHE["/tmp/synthetic"] = (0.0, 0, ([], None))
+    clear_tags_cache()
+    assert len(_PROFILE_TAGS_CACHE) == 0
+
+
+def test_rename_dialog_accepts_default_strategy_and_max_tags():
+    """The dialog should pre-select the strategy passed by the caller."""
+    import inspect
+    from wallpaper_analyzer.gui.rename_dialog import RenameDialog
+    sig = inspect.signature(RenameDialog.__init__)
+    assert "default_strategy" in sig.parameters
+    assert "max_tags" in sig.parameters
+
+
+def test_ai_models_redesigned_uses_backend_cards():
+    """AIModelsPage should expose backend cards and a hero summary."""
+    from wallpaper_analyzer.gui.pages.ai_models import (
+        AIModelsPage, BACKEND_DEFS, StatusDot, BackendCard,
+    )
+    assert {"lowlevel", "clip", "ollama"} <= {d["key"] for d in BACKEND_DEFS}
+    assert len(BACKEND_DEFS) >= 3
+    # Each def needs title, summary, pros/cons for the card to look complete
+    for d in BACKEND_DEFS:
+        assert d["title"]
+        assert d["summary"]
+        assert d["pros"]
+        assert d["cons"]
+
+
+def test_reorganize_rename_button_text():
+    """Reorganize header should expose Rename + Rename-only controls."""
+    import inspect
+    from wallpaper_analyzer.gui.pages import reorganize
+    src = inspect.getsource(reorganize)
+    assert "btn_rename_only" in src
+    assert "_RenameJob" in src
+    assert "compute_renames" in src or "build_renames" in src

@@ -15,16 +15,26 @@ class RenameDialog(QDialog):
 
     Shows a preview table with before/after, lets the user pick
     a strategy, and applies on confirmation.
+
+    Tag-based strategies (tags / category_tags / subject_tags / date_tags)
+    auto-detect tags from the image using the heuristic CV pipeline, which
+    is cached per (path, mtime, size) for the duration of the process.
     """
 
-    def __init__(self, files: List[str], category: str = "", parent=None):
+    def __init__(self, files: List[str], category: str = "", parent=None,
+                 default_strategy: str = "", max_tags: int = 3):
         super().__init__(parent)
         self.files = files
         self.category = category
         self.pairs: List[Tuple[str, str]] = []
+        self._max_tags_value = max_tags
         self.setWindowTitle(f"Rename {len(files)} Files")
-        self.setMinimumSize(720, 540)
+        self.setMinimumSize(760, 580)
         self._build()
+        if default_strategy:
+            idx = self._strat.findData(default_strategy)
+            if idx >= 0:
+                self._strat.setCurrentIndex(idx)
         self._apply_strategy()
 
     def _build(self):
@@ -45,7 +55,7 @@ class RenameDialog(QDialog):
         self._strat = QComboBox()
         for key, label, desc in RENAME_STRATEGIES:
             self._strat.addItem(f"{label}  -  {desc}", key)
-        self._strat.currentIndexChanged.connect(self._apply_strategy)
+        self._strat.currentIndexChanged.connect(self._on_strategy_changed)
         sgl.addRow("Type:", self._strat)
 
         # Options (per strategy)
@@ -66,6 +76,15 @@ class RenameDialog(QDialog):
         self._opt_truncate.setValue(32)
         self._opt_truncate.valueChanged.connect(self._apply_strategy)
         sgl.addRow("Max length (truncate):", self._opt_truncate)
+
+        self._opt_max_tags = QSpinBox()
+        self._opt_max_tags.setRange(1, 8)
+        self._opt_max_tags.setValue(self._max_tags_value)
+        self._opt_max_tags.setToolTip(
+            "How many content tags to embed for tag-based strategies."
+        )
+        self._opt_max_tags.valueChanged.connect(self._apply_strategy)
+        sgl.addRow("Max tags in filename:", self._opt_max_tags)
 
         self._dry = QCheckBox("Dry run (preview only, don't rename)")
         self._dry.setChecked(False)
@@ -103,12 +122,31 @@ class RenameDialog(QDialog):
         bb.addWidget(self._b_apply)
         l.addLayout(bb)
 
+    def _on_strategy_changed(self):
+        """Enable/disable strategy-specific knobs."""
+        strat = self._strat.currentData() or ""
+        is_tag = strat in ("tags", "category_tags", "subject_tags", "date_tags")
+        self._opt_max_tags.setEnabled(is_tag)
+        self._apply_strategy()
+
     def _apply_strategy(self):
         """Rebuild preview for the selected strategy."""
         strategy = self._strat.currentData()
         if not strategy:
             return
         try:
+            from ..rename import get_tags_for_file
+            tags_by_file = {}
+            subject_by_file = {}
+            if strategy in ("tags", "category_tags", "subject_tags", "date_tags"):
+                # Compute tags for each file (cached per (path, mtime, size))
+                for p in self.files:
+                    tags, subject = get_tags_for_file(
+                        p, category=self.category,
+                        max_tags=self._opt_max_tags.value(),
+                    )
+                    tags_by_file[p] = tags
+                    subject_by_file[p] = subject
             self.pairs = build_renames(
                 self.files,
                 strategy=strategy,
@@ -116,6 +154,9 @@ class RenameDialog(QDialog):
                 start=self._opt_start.value(),
                 pad=self._opt_pad.value(),
                 truncate_len=self._opt_truncate.value(),
+                tags_by_file=tags_by_file,
+                subject_by_file=subject_by_file,
+                max_tags=self._opt_max_tags.value(),
             )
         except Exception as e:
             self._stats.setText(f"Error building renames: {e}")
