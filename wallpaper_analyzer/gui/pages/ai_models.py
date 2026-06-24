@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QFormLayout, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QProgressBar, QPlainTextEdit, QWidget,
     QMessageBox, QFrame, QSizePolicy, QCheckBox, QDoubleSpinBox, QSpinBox,
+    QScrollArea,
 )
 from PySide6.QtCore import Qt, QTimer, QSize, Signal
 from PySide6.QtGui import QFont, QColor, QPainter, QPixmap, QIcon
@@ -158,19 +159,21 @@ class BackendCard(QFrame):
         self.setObjectName("backendCard")
         self.setCursor(Qt.PointingHandCursor)
         self.setMinimumWidth(220)
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.setMinimumHeight(180)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._build(defn)
         self._apply_style()
 
     def _build(self, d: dict):
         l = QVBoxLayout(self)
-        l.setContentsMargins(16, 14, 16, 14)
-        l.setSpacing(6)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(4)
 
+        # Header row: dot + title + subtitle + active badge
         head = QHBoxLayout()
         head.setSpacing(8)
         self._dot = StatusDot(d["color"], 10)
-        head.addWidget(self._dot)
+        head.addWidget(self._dot, 0, Qt.AlignTop)
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
         t = QLabel(d["title"])
@@ -186,36 +189,47 @@ class BackendCard(QFrame):
         title_box.addWidget(sub)
         head.addLayout(title_box, 1)
 
-        self._active_lbl = QLabel("")
+        self._active_lbl = QLabel("ACTIVE")
         self._active_lbl.setStyleSheet(
-            "color: #10b981; font-weight: 700; font-size: 9pt;"
+            "color: #10b981; font-weight: 700; font-size: 8pt;"
             " background: #0e1f18; padding: 2px 6px; border-radius: 4px;"
+            " letter-spacing: 1px;"
         )
         self._active_lbl.setVisible(False)
-        head.addWidget(self._active_lbl)
+        head.addWidget(self._active_lbl, 0, Qt.AlignTop)
         l.addLayout(head)
 
-        l.addWidget(_hrule())
+        # Thin separator (only if active, for emphasis)
+        if self._active:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setStyleSheet("color: #10b981; background: #10b981; max-height: 1px;")
+            l.addWidget(sep)
 
         summary = QLabel(d["summary"])
         summary.setWordWrap(True)
+        summary.setContentsMargins(0, 4, 0, 4)
         summary.setStyleSheet("color: #c0c0c0;")
         l.addWidget(summary)
 
-        pros = QLabel("\n".join(f"+ {p}" for p in d["pros"]))
+        # Compact pros/cons in two columns side by side
+        pc = QHBoxLayout()
+        pc.setSpacing(10)
+        pros = QLabel("\n".join(f"✓ {p}" for p in d["pros"]))
         pros.setStyleSheet("color: #5fbf80; font-size: 9pt;")
-        l.addWidget(pros)
-
-        cons = QLabel("\n".join(f"- {c}" for c in d["cons"]))
+        pros.setWordWrap(True)
+        pc.addWidget(pros, 1)
+        cons = QLabel("\n".join(f"✗ {c}" for c in d["cons"]))
         cons.setStyleSheet("color: #c08080; font-size: 9pt;")
-        l.addWidget(cons)
+        cons.setWordWrap(True)
+        pc.addWidget(cons, 1)
+        l.addLayout(pc)
 
         l.addStretch()
 
     def set_active(self, active: bool):
         self._active = active
         self._active_lbl.setVisible(active)
-        self._active_lbl.setText("ACTIVE")
         self._apply_style()
 
     def _apply_style(self):
@@ -228,6 +242,8 @@ class BackendCard(QFrame):
         self.setStyleSheet(
             f"QFrame#backendCard {{ background: {bg}; border: 1px solid {border};"
             " border-radius: 8px; }"
+            f"QFrame#backendCard:hover {{ border-color: #444; }}"
+            f"QFrame#backendCard[active=\"true\"] {{ border-color: {border}; }}"
         )
 
     def mousePressEvent(self, ev):
@@ -255,25 +271,42 @@ class AIModelsPage(QWidget):
     # ---------- BUILD ----------
 
     def _build(self):
+        # The page is wrapped in a QScrollArea so it stays usable even on
+        # short windows: everything below the fold scrolls instead of
+        # getting squashed to header-only tables.
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 24, 24, 24)
-        outer.setSpacing(12)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setObjectName("aiPageScroll")
+        outer.addWidget(scroll)
+
+        body = QWidget()
+        body.setObjectName("aiPageBody")
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(24, 20, 24, 20)
+        bl.setSpacing(12)
+        scroll.setWidget(body)
 
         title = QLabel("AI Models")
         title.setObjectName("title")
-        outer.addWidget(title)
+        bl.addWidget(title)
         sub = QLabel(
             "Pick a backend, install what you need, and tune thresholds. "
             "Changes are saved automatically."
         )
         sub.setObjectName("subtitle")
-        outer.addWidget(sub)
+        bl.addWidget(sub)
 
         # ---- Active-model hero ----
-        self._build_hero(outer)
+        self._build_hero(bl)
 
         # ---- Backend picker cards ----
-        outer.addWidget(_hrule())
+        bl.addWidget(_hrule())
         cards_row = QHBoxLayout()
         cards_row.setSpacing(10)
         cards_row.setContentsMargins(0, 4, 0, 4)
@@ -282,11 +315,12 @@ class AIModelsPage(QWidget):
             card.clicked.connect(self._on_backend_picked)
             self._backend_cards.append(card)
             cards_row.addWidget(card, 1)
-        outer.addLayout(cards_row)
+        bl.addLayout(cards_row)
 
         # ---- Backend panels (tabs) ----
         self._tabs = QTabWidget()
         self._tabs.setDocumentMode(True)
+        self._tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._build_clip_tab()
         self._build_ollama_tab()
         self._build_uncensored_tab()
@@ -294,16 +328,23 @@ class AIModelsPage(QWidget):
         self._tabs.addTab(self._ollama_tab, "Ollama")
         self._tabs.addTab(self._uncensored_tab, "Vision LLMs")
         self._tabs.currentChanged.connect(self._on_tab_changed)
-        outer.addWidget(self._tabs, 1)
+        bl.addWidget(self._tabs, 1)
 
-        # ---- Log ----
-        log_box = QGroupBox("Activity log")
-        ll = QVBoxLayout(log_box)
+        # ---- Log (collapsible) ----
+        # The log takes vertical space; allow users to collapse it so the
+        # model tables below the tab row get all the remaining height.
+        self._log_box = QGroupBox("Activity log")
+        self._log_box.setCheckable(True)
+        self._log_box.setChecked(False)  # collapsed by default
+        ll = QVBoxLayout(self._log_box)
         ll.setContentsMargins(8, 8, 8, 8)
+        ll.setSpacing(4)
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumBlockCount(400)
-        self._log.setMinimumHeight(110)
+        self._log.setMinimumHeight(80)
+        self._log.setMaximumHeight(120)
+        self._log.setVisible(False)
         ll.addWidget(self._log)
         log_row = QHBoxLayout()
         log_row.addStretch()
@@ -312,7 +353,12 @@ class AIModelsPage(QWidget):
         clear.clicked.connect(lambda: self._log.clear())
         log_row.addWidget(clear)
         ll.addLayout(log_row)
-        outer.addWidget(log_box)
+
+        # Show/hide the inner log widget when the groupbox is toggled.
+        self._log_box.toggled.connect(self._log.setVisible)
+        self._log_box.toggled.connect(self._log_box.setFlat)
+
+        bl.addWidget(self._log_box)
 
     def _build_hero(self, parent_layout):
         """Top hero card: shows the currently active backend + key params."""
@@ -323,19 +369,23 @@ class AIModelsPage(QWidget):
             " border-radius: 8px; }"
         )
         hl = QHBoxLayout(hero)
-        hl.setContentsMargins(16, 12, 16, 12)
-        hl.setSpacing(18)
+        hl.setContentsMargins(16, 10, 16, 10)
+        hl.setSpacing(16)
 
         left = QVBoxLayout()
-        left.setSpacing(2)
+        left.setSpacing(0)
         lbl = QLabel("ACTIVE SETUP")
         lbl.setStyleSheet("color: #888; font-size: 8pt; font-weight: 700; letter-spacing: 1px;")
         left.addWidget(lbl)
         self._hero_mode = QLabel("—")
-        self._hero_mode.setStyleSheet("font-size: 18pt; font-weight: 700; color: #ffffff;")
+        hf = QFont()
+        hf.setBold(True)
+        hf.setPointSize(14)
+        self._hero_mode.setFont(hf)
+        self._hero_mode.setStyleSheet("color: #ffffff;")
         left.addWidget(self._hero_mode)
         self._hero_model = QLabel("No model selected")
-        self._hero_model.setStyleSheet("color: #c0c0c0;")
+        self._hero_model.setStyleSheet("color: #c0c0c0; font-size: 9pt;")
         left.addWidget(self._hero_model)
         hl.addLayout(left, 1)
 
@@ -343,23 +393,23 @@ class AIModelsPage(QWidget):
 
         # Status indicators
         status_box = QVBoxLayout()
-        status_box.setSpacing(6)
+        status_box.setSpacing(4)
         s1 = QHBoxLayout()
         s1.setSpacing(6)
-        self._hero_clip_dot = StatusDot("#666")
+        self._hero_clip_dot = StatusDot("#666", 8)
         s1.addWidget(self._hero_clip_dot)
         self._hero_clip = QLabel("CLIP: unknown")
-        self._hero_clip.setStyleSheet("color: #c0c0c0;")
+        self._hero_clip.setStyleSheet("color: #c0c0c0; font-size: 9pt;")
         s1.addWidget(self._hero_clip)
         s1.addStretch()
         status_box.addLayout(s1)
 
         s2 = QHBoxLayout()
         s2.setSpacing(6)
-        self._hero_oll_dot = StatusDot("#666")
+        self._hero_oll_dot = StatusDot("#666", 8)
         s2.addWidget(self._hero_oll_dot)
         self._hero_oll = QLabel("Ollama: not tested")
-        self._hero_oll.setStyleSheet("color: #c0c0c0;")
+        self._hero_oll.setStyleSheet("color: #c0c0c0; font-size: 9pt;")
         s2.addWidget(self._hero_oll)
         s2.addStretch()
         status_box.addLayout(s2)
@@ -369,9 +419,22 @@ class AIModelsPage(QWidget):
 
     def _build_clip_tab(self):
         self._clip_tab = QWidget()
-        vl = QVBoxLayout(self._clip_tab)
-        vl.setContentsMargins(8, 12, 8, 8)
+        outer = QVBoxLayout(self._clip_tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Scroll area so the table stays accessible on small windows.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+
+        inner = QWidget()
+        vl = QVBoxLayout(inner)
+        vl.setContentsMargins(4, 8, 4, 4)
         vl.setSpacing(8)
+        scroll.setWidget(inner)
 
         # Intro
         intro = QLabel(
@@ -431,6 +494,8 @@ class AIModelsPage(QWidget):
         self._clip_table.setAlternatingRowColors(True)
         self._clip_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._clip_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._clip_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._clip_table.verticalHeader().setDefaultSectionSize(24)
         vl.addWidget(self._clip_table, 1)
 
         def _use_cb(_r, _c, d):
@@ -441,72 +506,98 @@ class AIModelsPage(QWidget):
 
     def _build_ollama_tab(self):
         self._ollama_tab = QWidget()
-        vl = QVBoxLayout(self._ollama_tab)
-        vl.setContentsMargins(8, 12, 8, 8)
-        vl.setSpacing(10)
+        outer = QVBoxLayout(self._ollama_tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        # Server bar
-        server_box = QGroupBox("Ollama server")
-        sl = QFormLayout(server_box)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+
+        inner = QWidget()
+        vl = QVBoxLayout(inner)
+        vl.setContentsMargins(4, 8, 4, 4)
+        vl.setSpacing(8)
+        scroll.setWidget(inner)
+
+        # Server + Pull combined into a single compact panel so the model
+        # table below gets most of the available vertical space.
+        top_box = QGroupBox("Ollama server")
+        tl = QVBoxLayout(top_box)
+        tl.setContentsMargins(10, 6, 10, 8)
+        tl.setSpacing(6)
+
         url_row = QHBoxLayout()
+        url_row.setSpacing(6)
+        url_lbl = QLabel("URL:")
+        url_lbl.setStyleSheet("color: #888;")
+        url_row.addWidget(url_lbl)
         self._oll_url = QLineEdit("http://localhost:11434")
         self._oll_url.setPlaceholderText("http://localhost:11434")
+        self._oll_url.setMinimumWidth(280)
         url_row.addWidget(self._oll_url, 1)
         self._oll_test_btn = QPushButton("Test connection")
         self._oll_test_btn.setObjectName("primary")
         self._oll_test_btn.clicked.connect(self._oll_test)
         url_row.addWidget(self._oll_test_btn)
-        url_widget = QWidget()
-        url_widget.setLayout(url_row)
-        sl.addRow("URL:", url_widget)
+        tl.addLayout(url_row)
 
+        status_row = QHBoxLayout()
+        status_row.setSpacing(12)
         self._oll_status = QLabel("Not tested")
         self._oll_status.setObjectName("statSmall")
-        sl.addRow("Status:", self._oll_status)
-
+        status_row.addWidget(self._oll_status, 1)
         self._oll_meta = QLabel("")
         self._oll_meta.setObjectName("statSmall")
         self._oll_meta.setStyleSheet("color: #888;")
-        sl.addRow("Server:", self._oll_meta)
-        vl.addWidget(server_box)
+        status_row.addWidget(self._oll_meta, 2)
+        tl.addLayout(status_row)
 
-        # Pull bar
-        pull_box = QGroupBox("Pull a model")
-        pl = QVBoxLayout(pull_box)
-        prow = QHBoxLayout()
+        # Pull bar — inline so the model table stays the focal point.
+        pull_row = QHBoxLayout()
+        pull_row.setSpacing(6)
+        pull_lbl = QLabel("Pull:")
+        pull_lbl.setStyleSheet("color: #888;")
+        pull_row.addWidget(pull_lbl)
         self._oll_combo = QComboBox()
         self._oll_combo.setEditable(True)
         self._oll_combo.addItems([
             "llava:7b", "llava:13b", "llama3.2-vision:11b",
             "minicpm-v:8b", "moondream:latest",
         ])
-        prow.addWidget(self._oll_combo, 1)
+        pull_row.addWidget(self._oll_combo, 1)
         self._oll_refresh_btn = QPushButton("Refresh list")
         self._oll_refresh_btn.setObjectName("ghost")
         self._oll_refresh_btn.clicked.connect(self._oll_refresh)
-        prow.addWidget(self._oll_refresh_btn)
+        pull_row.addWidget(self._oll_refresh_btn)
         self._oll_pull_btn = QPushButton("Pull")
         self._oll_pull_btn.setObjectName("success")
         self._oll_pull_btn.clicked.connect(self._oll_pull)
-        prow.addWidget(self._oll_pull_btn)
+        pull_row.addWidget(self._oll_pull_btn)
         self._oll_stop_btn = QPushButton("Stop")
         self._oll_stop_btn.setObjectName("danger")
         self._oll_stop_btn.setEnabled(False)
         self._oll_stop_btn.clicked.connect(self._oll_stop)
-        prow.addWidget(self._oll_stop_btn)
-        pl.addLayout(prow)
+        pull_row.addWidget(self._oll_stop_btn)
+        tl.addLayout(pull_row)
 
         self._oll_pull_prog = QProgressBar()
         self._oll_pull_prog.setVisible(False)
-        pl.addWidget(self._oll_pull_prog)
+        self._oll_pull_prog.setFixedHeight(6)
+        self._oll_pull_prog.setTextVisible(False)
+        tl.addWidget(self._oll_pull_prog)
         self._oll_pull_status = QLabel("")
         self._oll_pull_status.setObjectName("statSmall")
-        pl.addWidget(self._oll_pull_status)
-        vl.addWidget(pull_box)
+        tl.addWidget(self._oll_pull_status)
 
-        # Installed models table
+        vl.addWidget(top_box)
+
+        # Available models table — gets the leftover vertical space.
         installed_box = QGroupBox("Available models (click a row to activate / pull)")
         il = QVBoxLayout(installed_box)
+        il.setContentsMargins(6, 6, 6, 6)
         self._oll_table = QTableWidget(0, 6)
         self._oll_table.setHorizontalHeaderLabels(
             ["Tag", "Display name", "Size", "VRAM", "Speed/Quality", "Action"]
@@ -520,6 +611,8 @@ class AIModelsPage(QWidget):
         self._oll_table.setAlternatingRowColors(True)
         self._oll_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._oll_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._oll_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._oll_table.verticalHeader().setDefaultSectionSize(24)
         il.addWidget(self._oll_table)
 
         def _oll_act_cb(_r, _c, tag):
@@ -532,9 +625,21 @@ class AIModelsPage(QWidget):
     def _build_uncensored_tab(self):
         """Vision LLM recommendations + NSFW behavior settings."""
         self._uncensored_tab = QWidget()
-        vl = QVBoxLayout(self._uncensored_tab)
-        vl.setContentsMargins(8, 12, 8, 8)
-        vl.setSpacing(10)
+        outer = QVBoxLayout(self._uncensored_tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+
+        inner = QWidget()
+        vl = QVBoxLayout(inner)
+        vl.setContentsMargins(4, 8, 4, 4)
+        vl.setSpacing(8)
+        scroll.setWidget(inner)
 
         intro = QLabel(
             "Curated list of vision LLMs suited for wallpaper analysis. "
@@ -551,6 +656,9 @@ class AIModelsPage(QWidget):
         # NSFW behavior
         nsfw_box = QGroupBox("NSFW behavior")
         nl = QFormLayout(nsfw_box)
+        nl.setContentsMargins(10, 6, 10, 8)
+        nl.setHorizontalSpacing(12)
+        nl.setVerticalSpacing(4)
         self._nsfw_skip = QCheckBox(
             "Skip AI description when NSFW detected (use CV-only tags)"
         )
@@ -589,6 +697,7 @@ class AIModelsPage(QWidget):
         # Recommendations table
         rec_box = QGroupBox("Recommended vision LLMs")
         rl = QVBoxLayout(rec_box)
+        rl.setContentsMargins(6, 6, 6, 6)
         try:
             from ...ollama_client import get_recommended_uncensored_models
             uncensored = list(get_recommended_uncensored_models())
@@ -601,7 +710,7 @@ class AIModelsPage(QWidget):
                 ["Model", "Size", "Speed", "Notes", "Action"]
             )
             self._unc_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            self._unc_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            self._unc_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
             self._unc_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
             self._unc_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
             self._unc_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
@@ -609,6 +718,8 @@ class AIModelsPage(QWidget):
             self._unc_table.setAlternatingRowColors(True)
             self._unc_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             self._unc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self._unc_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self._unc_table.verticalHeader().setDefaultSectionSize(26)
             self._unc_table.setRowCount(len(uncensored))
             for i, m in enumerate(uncensored):
                 self._unc_table.setItem(i, 0, QTableWidgetItem(m.get("name", "?")))
