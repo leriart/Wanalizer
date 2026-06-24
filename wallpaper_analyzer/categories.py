@@ -4,7 +4,12 @@ from typing import Dict, List, Optional, Set
 
 from .settings import resolve_dest_dir, load_settings
 
-SPECIAL_FOLDERS: Set[str] = {"Duplicates", "Low-Quality", "Discarded", "Uncategorized"}
+SPECIAL_FOLDERS: Set[str] = {"Duplicates", "Low-Quality", "Discarded", "Uncategorized", "NSFW"}
+NSFW_FOLDER: str = "NSFW"
+LOW_QUALITY_FOLDER: str = "Low-Quality"
+DISCARDED_FOLDER: str = "Discarded"
+DUPLICATES_FOLDER: str = "Duplicates"
+UNCATEGORIZED_FOLDER: str = "Uncategorized"
 CATEGORIES_DIR: str = ""
 CATEGORIES: List[str] = []
 _CATEGORY_TAGS: Dict[str, Set[str]] = {}
@@ -40,6 +45,45 @@ def _is_category_folder(folder_name: str) -> bool:
     if folder_name in SPECIAL_FOLDERS:
         return False
     return os.path.isdir(os.path.join(CATEGORIES_DIR, folder_name))
+
+
+def list_category_folders(dest: Optional[str] = None,
+                          include_unconfigured: bool = True) -> List[str]:
+    """Return category folder names under `dest`.
+
+    Defaults to CATEGORIES_DIR when no path is given. By default the
+    list contains every subfolder of `dest` that is not in
+    SPECIAL_FOLDERS, including folders without a `.category.json`.
+    Set `include_unconfigured=False` to restrict to folders that have a
+    `.category.json` (i.e. already discovered).
+    """
+    base = dest if dest is not None else CATEGORIES_DIR
+    out: List[str] = []
+    if not base or not os.path.isdir(base):
+        return out
+    for name in sorted(os.listdir(base)):
+        if name.startswith(".") or name in SPECIAL_FOLDERS:
+            continue
+        p = os.path.join(base, name)
+        if not os.path.isdir(p):
+            continue
+        if not include_unconfigured:
+            if not os.path.isfile(os.path.join(p, ".category.json")):
+                continue
+        out.append(name)
+    return out
+
+
+def count_media_in(folder: str) -> int:
+    """Count media files directly inside `folder` (non-recursive)."""
+    from .formats import STATIC_EXTENSIONS, ANIMATED_EXTENSIONS
+    if not os.path.isdir(folder):
+        return 0
+    exts = STATIC_EXTENSIONS | ANIMATED_EXTENSIONS
+    return sum(1 for f in os.listdir(folder)
+               if os.path.isfile(os.path.join(folder, f))
+               and os.path.splitext(f)[1].lower() in exts
+               and not f.startswith("."))
 
 
 def _build_category_icons():

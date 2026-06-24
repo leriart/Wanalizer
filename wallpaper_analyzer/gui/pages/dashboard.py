@@ -141,9 +141,9 @@ class DashboardPage(QWidget):
                         1 for f in os.listdir(p)
                         if os.path.isfile(os.path.join(p, f)) and not f.startswith(".")
                     )
-                elif e == "Duplicates":
+                elif e == c.DUPLICATES_FOLDER:
                     dupes += sum(1 for f in os.listdir(p) if os.path.isfile(os.path.join(p, f)))
-                elif e == "NSFW":
+                elif e == c.NSFW_FOLDER:
                     nsfw += sum(1 for f in os.listdir(p) if os.path.isfile(os.path.join(p, f)))
         self._cards["total"].setText(str(n_files))
         self._cards["cats"].setText(str(n_cats))
@@ -154,13 +154,29 @@ class DashboardPage(QWidget):
     def _check_health(self):
         cfg = s.load_settings()
         try:
-            import torch as _
-            import clip as _
+            import torch
+            torch_ok = True
+        except Exception:
+            torch_ok = False
+        try:
+            import clip
+            clip_ok = True
+        except Exception:
+            clip_ok = False
+        if torch_ok and clip_ok:
             self._clip_status.setText("CLIP: Ready")
             self._clip_status.setObjectName("statusOk")
-        except Exception:
+        elif torch_ok:
+            self._clip_status.setText("CLIP: Missing (torch OK)")
+            self._clip_status.setObjectName("statusWarn")
+        elif clip_ok:
+            self._clip_status.setText("CLIP: Missing (clip OK)")
+            self._clip_status.setObjectName("statusWarn")
+        else:
             self._clip_status.setText("CLIP: Not installed")
             self._clip_status.setObjectName("statusErr")
+        self._clip_status.style().unpolish(self._clip_status)
+        self._clip_status.style().polish(self._clip_status)
 
         url = cfg.get("ollama_url", "http://localhost:11434")
         model = cfg.get("ollama_model", "llava:7b")
@@ -193,6 +209,9 @@ class DashboardPage(QWidget):
             self._ollama_status.setText(f"Offline: {result.get('error', '')}")
             self._ollama_status.setObjectName("statusErr")
             self._ollama_bar.setValue(0)
+        self._ollama_status.style().unpolish(self._ollama_status)
+        self._ollama_status.style().polish(self._ollama_status)
+        QTimer.singleShot(1500, lambda: self._ollama_bar.setVisible(False))
 
     def append_log(self, msg):
         self._log.appendPlainText(msg)

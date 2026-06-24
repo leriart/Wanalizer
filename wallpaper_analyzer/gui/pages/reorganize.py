@@ -469,6 +469,12 @@ class ReorganizePage(QWidget):
         self.btn_ref.clicked.connect(self._refresh)
         hl.addWidget(self.btn_ref)
 
+        self.btn_open_dest = QPushButton("Open folder")
+        self.btn_open_dest.setObjectName("ghost")
+        self.btn_open_dest.setToolTip("Open the destination folder in the system file manager.")
+        self.btn_open_dest.clicked.connect(self._open_destination)
+        hl.addWidget(self.btn_open_dest)
+
         l.addWidget(hdr)
 
         # ----- Body splitter -----
@@ -1257,7 +1263,7 @@ class ReorganizePage(QWidget):
 
         # Remove the moved items from the grid (and from _all_files).
         self._remove_paths_from_view(set(p for p in paths if p))
-        self._undo_btn.setEnabled(bool(self._undo_stack))
+        self._update_undo_label()
         msg = f"Moved {moved} file{'s' if moved != 1 else ''} -> {target_cat}"
         if skipped:
             msg += f"  ({skipped} skipped)"
@@ -1334,6 +1340,20 @@ class ReorganizePage(QWidget):
 
     # ------------------------ UNDO ------------------------
 
+    def _open_destination(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        dest = s.resolve_dest_dir(s.load_settings())
+        if not os.path.isdir(dest):
+            QMessageBox.warning(self, "Missing folder", f"Destination does not exist:\n{dest}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(dest))
+
+    def _update_undo_label(self):
+        n = len(self._undo_stack)
+        self._undo_btn.setText(f"Undo ({n})" if n else "Undo")
+        self._undo_btn.setEnabled(n > 0)
+
     def _on_undo(self):
         if not self._undo_stack:
             return
@@ -1360,7 +1380,7 @@ class ReorganizePage(QWidget):
             self.main.append_log(f"[Reorganize] Undo: {os.path.basename(dst)} -> {src_cat or 'root'}")
         except Exception as e:
             QMessageBox.warning(self, "Undo failed", str(e))
-        self._undo_btn.setEnabled(bool(self._undo_stack))
+        self._update_undo_label()
         # Reload from disk so the user sees the restored file in context.
         QTimer.singleShot(100, self._populate)
 
@@ -1368,7 +1388,7 @@ class ReorganizePage(QWidget):
 
     def _refresh(self):
         self._undo_stack.clear()
-        self._undo_btn.setEnabled(False)
+        self._update_undo_label()
         self._load_cats()
 
     def _on_rename(self):

@@ -19,6 +19,7 @@ from .formats import (
     WALLPAPERS_DIR,
     supported_image_files,
 )
+from . import formats as _formats_mod
 from . import categories as c
 from . import tags as t
 from .duplicates import (
@@ -208,6 +209,8 @@ def _learn_tags_for_category(category: str, profile: dict) -> int:
 
 def flatten_all(include_category_dirs: bool = False):
     """Move all image files from subdirectories back into the source root."""
+    global WALLPAPERS_DIR
+    WALLPAPERS_DIR = _formats_mod.WALLPAPERS_DIR
     print("Flattening directory structure...")
     skip_dirs = set(SKIP_DIRS)
     if not include_category_dirs:
@@ -406,6 +409,8 @@ def organize(mode: str = "lowlevel",
              rename_use_tags: bool = True,
              rename_max_tags: int = 3):
     """Main organization pipeline with pluggable analyzer modes."""
+    global WALLPAPERS_DIR
+    WALLPAPERS_DIR = _formats_mod.WALLPAPERS_DIR
     s = load_settings()
     s["organize_mode"] = mode
     save_settings(s)

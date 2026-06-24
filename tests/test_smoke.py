@@ -110,6 +110,96 @@ def test_cli_parser_builds():
     assert ns.dry is True
     assert ns.dedupe is True
     assert ns.parallel is None
-    ns2 = parser.parse_args(["--no-dedupe", "--parallel", "4"])
+    assert ns.source is None
+    ns2 = parser.parse_args(["--no-dedupe", "--parallel", "4", "--source", "/tmp"])
     assert ns2.dedupe is False
     assert ns2.parallel == 4
+    assert ns2.source == "/tmp"
+
+
+def test_cli_source_rejects_missing_dir():
+    """The CLI must validate --source early and exit non-zero if missing."""
+    from wallpaper_analyzer.cli import _build_parser
+    from wallpaper_analyzer import formats
+
+    original = formats.WALLPAPERS_DIR
+    p = _build_parser()
+    ns = p.parse_args(["--source", "/this/path/does/not/exist/__nope__"])
+    assert ns.source == "/this/path/does/not/exist/__nope__"
+    # Validation runs inside main(); parsing alone must not mutate globals
+    assert formats.WALLPAPERS_DIR == original
+
+
+def test_categories_special_folders_contains_nsfw():
+    from wallpaper_analyzer.categories import SPECIAL_FOLDERS, NSFW_FOLDER
+
+    assert NSFW_FOLDER in SPECIAL_FOLDERS
+    assert "Duplicates" in SPECIAL_FOLDERS
+    assert "Low-Quality" in SPECIAL_FOLDERS
+
+
+def test_list_category_folders_helper(tmp_path):
+    from wallpaper_analyzer.categories import (
+        list_category_folders, count_media_in, SPECIAL_FOLDERS,
+    )
+
+    (tmp_path / "Anime").mkdir()
+    (tmp_path / "Anime" / "a.jpg").write_bytes(b"x")
+    (tmp_path / "Anime" / "b.png").write_bytes(b"x")
+    (tmp_path / "Empty").mkdir()
+    for special in ("Duplicates", "Low-Quality", "Discarded", "Uncategorized", "NSFW"):
+        (tmp_path / special).mkdir()
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / "not_a_dir.txt").write_text("x")
+
+    cats = list_category_folders(str(tmp_path))
+    assert "Anime" in cats
+    assert "Empty" in cats
+    assert ".hidden" not in cats
+    assert "not_a_dir.txt" not in cats
+    for s in SPECIAL_FOLDERS:
+        assert s not in cats
+
+    # Restricted to configured-only
+    (tmp_path / "Anime" / ".category.json").write_text("{}")
+    cats2 = list_category_folders(str(tmp_path), include_unconfigured=False)
+    assert "Anime" in cats2
+    assert "Empty" not in cats2
+
+    assert count_media_in(str(tmp_path / "Anime")) == 2
+    assert count_media_in(str(tmp_path / "Empty")) == 0
+
+
+def test_settings_source_dir_default():
+    from wallpaper_analyzer.settings import SETTINGS_DEFAULTS
+
+    assert "source_dir" in SETTINGS_DEFAULTS
+    assert SETTINGS_DEFAULTS["source_dir"] == ""
+
+
+def test_workers_get_tags_ollama_uses_public_categories_alias():
+    """Regression: _get_tags_ollama must reference cats_mod, not the
+    method-local c_mod alias (which would raise NameError)."""
+    import inspect
+    from wallpaper_analyzer.gui.workers import GenerateTagsWorker
+
+    src = inspect.getsource(GenerateTagsWorker._get_tags_ollama)
+    assert "c_mod.get_category_config" not in src
+    assert "cats_mod.get_category_config" in src
+
+
+def test_duplicates_scan_uses_custom_exception():
+    """Regression: StopIteration-as-control-flow is deprecated/removed in 3.14."""
+    import inspect
+    from wallpaper_analyzer.gui.pages.duplicates import DupeScanWorker
+
+    src = inspect.getsource(DupeScanWorker.run)
+    assert "raise StopIteration" not in src
+    assert "_ScanCancelled" in src
+
+
+def test_light_theme_supported_in_apply_theme():
+    from wallpaper_analyzer.gui.theme import apply_theme, LIGHT_QSS
+
+    assert callable(apply_theme)
+    assert isinstance(LIGHT_QSS, str) and len(LIGHT_QSS) > 0

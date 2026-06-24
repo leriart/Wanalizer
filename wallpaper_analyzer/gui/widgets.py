@@ -115,8 +115,7 @@ class TableButtonDelegate(QStyledItemDelegate):
             return
 
         rects = self._compute_rects(option.rect, texts)
-        is_disabled = bool(option.state & QStyle.State_Selected) is False and \
-                      not (option.state & QStyle.State_Enabled)
+        is_disabled = not (option.state & QStyle.State_Enabled)
 
         row, col = index.row(), index.column()
         for i, (text, kind, r) in enumerate(zip(texts[:n], kinds[:n], rects[:n])):

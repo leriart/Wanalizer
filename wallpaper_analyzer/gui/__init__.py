@@ -162,7 +162,9 @@ def main():
         )
         app = QApplication(sys.argv)
         app.setFont(QFont(_detect_font(), 10))
-        apply_theme(app)
+        from .. import settings as _s
+        _cfg = _s.load_settings()
+        apply_theme(app, mode=_cfg.get("theme", "dark"))
         w = MainWindow()
         w.show()
         return app.exec()

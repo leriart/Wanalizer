@@ -536,8 +536,21 @@ QScrollArea {
 """
 
 
-def apply_theme(app):
+LIGHT_QSS = """
+/* Light theme — placeholder. The dark theme is the only fully-styled
+   variant; selecting "Light" in Settings falls back to the OS default
+   palette so the UI is still usable without crashing on missing rules. */
+QToolTip { color: #000; background: #ffffe0; border: 1px solid #888; }
+"""
+
+
+def apply_theme(app, mode: str = "dark"):
     from PySide6.QtGui import QPalette, QColor
+
+    if mode == "light":
+        app.setStyleSheet(LIGHT_QSS)
+        app.setPalette(app.style().standardPalette())
+        return
 
     app.setStyleSheet(QSS)
 

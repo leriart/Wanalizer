@@ -12,6 +12,7 @@ class TagsPage(QWidget):
     def __init__(self, main):
         super().__init__()
         self.main = main
+        self._dirty = False
         self._build()
         self._refresh()
 
@@ -104,6 +105,7 @@ class TagsPage(QWidget):
         self._tag_edit.clear()
         self._load_group()
         self._status.setText(f"Added '{tag}'")
+        self._mark_dirty()
 
     def _rm_tag(self, group_key, tag):
         grp = self._data["groups"].get(group_key, {})
@@ -113,7 +115,16 @@ class TagsPage(QWidget):
             grp["tags"] = tags_list
         self._load_group()
         self._status.setText(f"Removed '{tag}'")
+        self._mark_dirty()
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self._btn_save.setText("Save All Tags *")
+        self._btn_save.setObjectName("danger")
 
     def _save_all(self):
         t.save_tags(self._data)
+        self._dirty = False
+        self._btn_save.setText("Save All Tags")
+        self._btn_save.setObjectName("success")
         QMessageBox.information(self, "Saved", "Tags saved to tags.json")

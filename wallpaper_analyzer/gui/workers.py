@@ -50,7 +50,7 @@ class OrganizeWorker(QThread):
     def __init__(self, mode="lowlevel", dry=False, dedupe=True, parallel=1,
                  quality_min=0.0, source_dir=None, cats_dir=None,
                  rename_strategy="none", rename_category_prefix=True,
-                 rename_max_tags: int = 3):
+                 rename_max_tags: int = 3, full_reset: bool = False):
         super().__init__()
         self.mode = mode
         self.dry = dry
@@ -62,6 +62,7 @@ class OrganizeWorker(QThread):
         self.rename_strategy = rename_strategy
         self.rename_category_prefix = rename_category_prefix
         self.rename_max_tags = rename_max_tags
+        self.full_reset = full_reset
         self._cancel = False
 
     def cancel(self):
@@ -74,6 +75,11 @@ class OrganizeWorker(QThread):
             if self.cats_dir:
                 cats_mod.CATEGORIES_DIR = self.cats_dir
                 cats_mod.discover_categories(self.cats_dir)
+
+            if self.full_reset:
+                from .organize import flatten_all
+                self.log.emit("Full reset: flattening directories...")
+                flatten_all(include_category_dirs=True)
 
             r, w = os.pipe()
             orig = sys.stdout
@@ -450,7 +456,7 @@ class GenerateTagsWorker(QThread):
         # the LLM has discriminating choices instead of 150 generic
         # candidates. Then intersect with what already exists in this
         # category so the LLM must suggest something *new*.
-        existing = c_mod.get_category_config(self.category_name).get("tags") or []
+        existing = cats_mod.get_category_config(self.category_name).get("tags") or []
         available = build_focused_curated_list(
             full_registry=tag_list,
             existing=existing,

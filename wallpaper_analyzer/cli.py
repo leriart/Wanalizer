@@ -6,6 +6,7 @@ import argparse
 from .settings import load_settings, save_settings, resolve_dest_dir, PROJECT_DIR
 from .categories import discover_categories
 from .formats import STATIC_EXTENSIONS, ANIMATED_EXTENSIONS
+from . import formats as _formats
 from .organize import organize, flatten_all
 from .duplicates import load_hash_cache, find_duplicate_groups
 from .parallel import cpu_count
@@ -42,6 +43,10 @@ def _build_parser():
                              "when CLIP is installed).")
     parser.add_argument("--dest", "-d", metavar="DIR", default=None,
                         help="Destination directory for organized wallpapers (def: WP/)")
+    parser.add_argument("--source", "-s", metavar="DIR", default=None,
+                        help="Source directory with wallpapers to organize "
+                             "(def: project directory). The directory is scanned "
+                             "recursively; supported images are organized into --dest.")
     parser.add_argument("--dry", action="store_true",
                         help="Dry run: analyze only, don't move files")
     parser.add_argument("--full", "-f", action="store_true",
@@ -125,6 +130,13 @@ def main():
         s["dest_dir"] = os.path.abspath(args.dest)
         save_settings(s)
 
+    if args.source:
+        src = os.path.abspath(args.source)
+        if not os.path.isdir(src):
+            print(f"Error: source directory not found: {src}", flush=True)
+            return 2
+        _formats.WALLPAPERS_DIR = src
+
     if args.check_deps:
         _check_deps()
         return
@@ -191,6 +203,7 @@ def main():
     parallel = args.parallel if args.parallel is not None else max(1, cpu_count())
     print(f"Wanalizer v3.0")
     print(f"Mode: {args.mode.upper()}")
+    print(f"Source: {_formats.WALLPAPERS_DIR}")
     print(f"Destination: {dest_dir}")
     print(f"Directory: {os.getcwd()}")
     print(f"Workers: {parallel}\n")
@@ -203,8 +216,10 @@ def main():
         flatten_all(include_category_dirs=True)
 
     os.makedirs(dest_dir, exist_ok=True)
-    root_files = [f for f in os.listdir(".")
-                  if os.path.isfile(f) and not f.startswith(".")
+    scan_dir = _formats.WALLPAPERS_DIR
+    root_files = [f for f in os.listdir(scan_dir)
+                  if os.path.isfile(os.path.join(scan_dir, f))
+                  and not f.startswith(".")
                   and os.path.splitext(f)[1].lower() in (STATIC_EXTENSIONS | ANIMATED_EXTENSIONS)]
 
     if root_files:
@@ -215,7 +230,7 @@ def main():
             parallel=parallel,
         )
     else:
-        print("No files at root. Flattening structure first...\n")
+        print(f"No files at source root ({scan_dir}). Flattening structure first...\n")
         flatten_all(include_category_dirs=args.full)
         organize(
             mode=args.mode,
@@ -226,4 +241,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    _sys.exit(main())

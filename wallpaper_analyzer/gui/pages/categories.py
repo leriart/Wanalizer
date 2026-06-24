@@ -157,11 +157,31 @@ class CategoriesPage(QWidget):
             "regeneration significantly on libraries heavy in videos."
         )
         self._skip_videos.setChecked(cfg.get("regen_skip_videos", False))
+        self._skip_videos.stateChanged.connect(
+            lambda _s: self._persist_regen_settings(skip_videos=self._skip_videos.isChecked())
+        )
         self.btn_ref = QPushButton("Refresh")
         self.btn_ref.setObjectName("ghost")
         self.btn_ref.clicked.connect(self._refresh)
+        self.btn_open_dest = QPushButton("Open destination")
+        self.btn_open_dest.setObjectName("ghost")
+        self.btn_open_dest.setToolTip("Open the destination folder in the system file manager.")
+        self.btn_open_dest.clicked.connect(self._open_destination)
+        tb.addWidget(self.btn_add)
+        tb.addWidget(self.btn_import)
+        tb.addWidget(self.btn_gen)
+        tb.addWidget(self.btn_regen)
+        tb.addWidget(self._skip_videos)
+        tb.addStretch()
+        tb.addWidget(self.btn_open_dest)
+        tb.addWidget(self.btn_ref)
+        l.addLayout(tb)
+
+        # Secondary toolbar (config + AI helpers)
+        tb2 = QHBoxLayout()
         self.btn_pattern = QPushButton("Build Patterns")
         self.btn_pattern.setObjectName("ghost")
+        self.btn_pattern.setToolTip("Rebuild heuristic CV patterns from current sample images.")
         self.btn_pattern.clicked.connect(self._build_patterns)
         self.btn_config = QPushButton("Configure (Q&A)")
         self.btn_config.setObjectName("ghost")
@@ -178,17 +198,11 @@ class CategoriesPage(QWidget):
             "expected-content config for the selected category."
         )
         self.btn_ai.clicked.connect(self._open_ai_suggest)
-        tb.addWidget(self.btn_add)
-        tb.addWidget(self.btn_import)
-        tb.addWidget(self.btn_gen)
-        tb.addWidget(self.btn_regen)
-        tb.addWidget(self._skip_videos)
-        tb.addWidget(self.btn_ref)
-        tb.addWidget(self.btn_pattern)
-        tb.addWidget(self.btn_config)
-        tb.addWidget(self.btn_ai)
-        tb.addStretch()
-        l.addLayout(tb)
+        tb2.addWidget(self.btn_pattern)
+        tb2.addWidget(self.btn_config)
+        tb2.addWidget(self.btn_ai)
+        tb2.addStretch()
+        l.addLayout(tb2)
 
         self._table = QTableWidget(0, 5)
         self._table.setHorizontalHeaderLabels(["Category", "Images", "Tags / Prompt", "Actions", ""])
@@ -400,6 +414,25 @@ class CategoriesPage(QWidget):
         self._ai_status.style().unpolish(self._ai_status)
         self._ai_status.style().polish(self._ai_status)
 
+    def _persist_regen_settings(self, samples=None, skip_videos=None,
+                              vision_model=None, text_model=None,
+                              vision_timeout=None, text_timeout=None):
+        """Persist the AI-regeneration UI state to disk so it survives restarts."""
+        cfg = s.load_settings()
+        if samples is not None:
+            cfg["regen_samples"] = int(samples)
+        if skip_videos is not None:
+            cfg["regen_skip_videos"] = bool(skip_videos)
+        if vision_model:
+            cfg["regen_vision_model"] = vision_model
+        if text_model:
+            cfg["regen_text_model"] = text_model
+        if vision_timeout is not None:
+            cfg["regen_vision_timeout"] = int(vision_timeout)
+        if text_timeout is not None:
+            cfg["regen_text_timeout"] = int(text_timeout)
+        s.save_settings(cfg)
+
     def _refresh(self):
         c.discover_categories()
         dest = s.resolve_dest_dir(s.load_settings())
@@ -463,6 +496,13 @@ class CategoriesPage(QWidget):
         refresh_action_columns(self._table)
         self._info.setText(f"{len(conf)} configured, {len(unconf)} unconfigured categories")
 
+    def _open_destination(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        dest = s.resolve_dest_dir(s.load_settings())
+        os.makedirs(dest, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(dest))
+
     def _add(self):
         name, ok = QInputDialog.getText(self, "New Category", "Category name (folder name):")
         if not ok or not name.strip():
@@ -525,7 +565,15 @@ class CategoriesPage(QWidget):
         dest = s.resolve_dest_dir(s.load_settings())
         c.CATEGORIES_DIR = dest
         c.discover_categories(dest)
+        # Include all subfolders of dest (even those without .category.json)
+        # so the user can import into freshly created but unconfigured folders.
         cats = list(c.CATEGORIES)
+        if os.path.isdir(dest):
+            for e in sorted(os.listdir(dest)):
+                p = os.path.join(dest, e)
+                if (os.path.isdir(p) and not e.startswith(".")
+                        and e not in c.SPECIAL_FOLDERS and e not in cats):
+                    cats.append(e)
         if not cats:
             QMessageBox.warning(self, "No Categories", "Create a category first.")
             return
@@ -570,12 +618,10 @@ class CategoriesPage(QWidget):
             nc = dlg.name_edit.text().strip()
             if not nc:
                 return
-            new_cfg = {
-                "name": nc,
-                "tags": dlg._tags,
-                "prompt": dlg._prompt_edit.toPlainText().strip(),
-                "palette_weights": {},
-            }
+            new_cfg = dict(cfg) if cfg else {}
+            new_cfg["name"] = nc
+            new_cfg["tags"] = dlg._tags
+            new_cfg["prompt"] = dlg._prompt_edit.toPlainText().strip()
             dest = s.resolve_dest_dir(s.load_settings())
             c.CATEGORIES_DIR = dest
             c.write_category_config(name, new_cfg)
@@ -676,6 +722,15 @@ class CategoriesPage(QWidget):
         if hasattr(self, "_regen_worker") and self._regen_worker and self._regen_worker.isRunning():
             self._log.appendPlainText("[INFO] A regeneration is already running.")
             return
+
+        self._persist_regen_settings(
+            samples=samples,
+            skip_videos=skip_videos,
+            vision_model=vision_model,
+            text_model=text_model,
+            vision_timeout=v_to,
+            text_timeout=t_to,
+        )
 
         self._regen_worker = RegenerateCategoryWorker(
             category_name=name,

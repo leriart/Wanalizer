@@ -10,7 +10,6 @@ from PySide6.QtCore import Qt, QTimer
 from ... import settings as s
 from ... import formats as f
 from ... import categories as c
-from ... import organize as o
 from ...rename import RENAME_STRATEGIES
 from ...ollama_client import OLLAMA_VISION_MODELS
 from ..workers import OrganizeWorker
@@ -36,7 +35,9 @@ class OrganizePage(QWidget):
 
         # Source folder
         h = QHBoxLayout()
-        self._dir_edit = QLineEdit(s.PROJECT_DIR)
+        _init_cfg = s.load_settings()
+        _init_src = _init_cfg.get("source_dir") or s.PROJECT_DIR
+        self._dir_edit = QLineEdit(_init_src)
         self._dir_edit.setMinimumWidth(200)
         b = QPushButton("Browse...")
         b.clicked.connect(lambda: self._browse("source"))
@@ -79,14 +80,15 @@ class OrganizePage(QWidget):
         self.cb_dedupe = QCheckBox("Find and remove duplicates")
         self.cb_dedupe.setChecked(True)
         self.cb_full = QCheckBox("Full reset (flatten all)")
+        cfg = s.load_settings()
         self.spin_parallel = QSpinBox()
         self.spin_parallel.setRange(1, 16)
-        self.spin_parallel.setValue(4)
+        self.spin_parallel.setValue(int(cfg.get("parallel", 4) or 4))
         self.spin_parallel.setPrefix("Workers: ")
         self.spin_quality = QDoubleSpinBox()
         self.spin_quality.setRange(0, 1)
         self.spin_quality.setSingleStep(0.05)
-        self.spin_quality.setValue(0.0)
+        self.spin_quality.setValue(float(cfg.get("quality_min", 0.0) or 0.0))
         self.spin_quality.setPrefix("Min quality: ")
         gl.addWidget(self.cb_dry, 0, 0)
         gl.addWidget(self.cb_dedupe, 0, 1)
@@ -283,6 +285,9 @@ class OrganizePage(QWidget):
         cfg = s.load_settings()
         cfg["organize_mode"] = mode
         cfg["dest_dir"] = dest
+        cfg["source_dir"] = src
+        cfg["parallel"] = self.spin_parallel.value()
+        cfg["quality_min"] = self.spin_quality.value()
         cfg["ollama_nsfw_enabled"] = self.cb_nsfw.isChecked()
         cfg["ollama_describe_enabled"] = self.cb_describe.isChecked()
         cfg["ollama_classify_enabled"] = self.cb_classify.isChecked()
@@ -303,9 +308,7 @@ class OrganizePage(QWidget):
         self.main.append_log(f"Mode: {mode}  Source: {src}  Destination: {dest}")
 
         if self.cb_full.isChecked():
-            self._log.appendPlainText("Full reset: flattening directories...")
-            f.WALLPAPERS_DIR = src
-            o.flatten_all(include_category_dirs=True)
+            self._log.appendPlainText("Full reset will run before classification.")
 
         self.worker = OrganizeWorker(
             mode=mode,
@@ -318,6 +321,7 @@ class OrganizePage(QWidget):
             rename_strategy=self._rename_strat.currentData() or "none",
             rename_category_prefix=self.cb_rename_prefix.isChecked(),
             rename_max_tags=self._max_tags.value(),
+            full_reset=self.cb_full.isChecked(),
         )
         self.worker.progress.connect(self._prog)
         self.worker.log.connect(self._log.appendPlainText)

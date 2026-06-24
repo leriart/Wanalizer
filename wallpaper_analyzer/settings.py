@@ -8,6 +8,7 @@ TAGS_PATH = os.path.join(PROJECT_DIR, "tags.json")
 SETTINGS_DEFAULTS = {
     "theme": "dark",
     "organize_mode": "lowlevel",
+    "source_dir": "",
     "dest_dir": "WP",
     "dedupe": True,
     "video_ffmpeg": True,

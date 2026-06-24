@@ -38,7 +38,7 @@ def _collect_all_files(dest_dir: str) -> list:
     for d, _, fns in os.walk(dest_dir):
         rel = os.path.relpath(d, dest_dir)
         parts = rel.split(os.sep)
-        if any(p.startswith(".") or p in c.SPECIAL_FOLDERS or p == "Duplicates" for p in parts):
+        if any(p.startswith(".") or p in c.SPECIAL_FOLDERS for p in parts):
             continue
         for fn in fns:
             if fn.startswith("."):
@@ -46,6 +46,10 @@ def _collect_all_files(dest_dir: str) -> list:
             if os.path.splitext(fn)[1].lower() in exts:
                 out.append(os.path.join(d, fn))
     return out
+
+
+class _ScanCancelled(Exception):
+    """Raised internally to abort a running scan_and_hash."""
 
 
 class DupeScanWorker(QThread):
@@ -72,10 +76,10 @@ class DupeScanWorker(QThread):
             def cb(cur, total, fn, st):
                 self.progress.emit(cur, total, os.path.basename(fn), st)
                 if self._cancel:
-                    raise StopIteration("cancelled")
+                    raise _ScanCancelled()
             try:
                 scan_and_hash(self.files, self.cache, progress_callback=cb, parallel=4)
-            except StopIteration:
+            except _ScanCancelled:
                 self.log.emit("[CANCELLED]")
                 return
             self.log.emit("Hashing complete. Finding duplicates...")
