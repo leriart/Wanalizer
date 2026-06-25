@@ -664,13 +664,21 @@ def _clip_tag_vocab() -> List[str]:
 
 
 # Backend identifiers accepted by ai_detect_tags() / AIRenamer
-AI_TAG_BACKENDS = ("auto", "heuristic", "clip", "ollama")
+AI_TAG_BACKENDS = ("auto", "heuristic", "clip", "ollama", "organize")
 
 # Analyzer modes the AI renamer can run on top of. Each mode is the
 # SAME analyzer the organize pipeline uses for category assignment,
 # so the tags come from the same content analysis that picked the
 # category. Default ("auto") picks the configured organize_mode.
 AI_TAG_MODES = ("auto", "lowlevel", "fusion", "clip", "ollama")
+
+# Organize-style AI option defaults (mirrors the Organize page).
+ORGANIZE_AI_OPTIONS = {
+    "ollama_nsfw_enabled": True,
+    "ollama_describe_enabled": False,
+    "ollama_classify_enabled": False,
+    "ollama_classify_method": "tags",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -733,13 +741,18 @@ class AIRenamer:
                  model: Optional[str] = None,
                  max_tags: int = 8,
                  cache_size: int = 4096,
-                 force_reprocess: bool = False):
+                 force_reprocess: bool = False,
+                 organize_options: Optional[Dict] = None):
         self.backend = backend if backend in AI_TAG_BACKENDS else "heuristic"
         self.mode = mode if mode in AI_TAG_MODES else "auto"
         self.model = model or None
         self.max_tags = max_tags
         self._cache_size = cache_size
         self._force_reprocess = force_reprocess
+        # Organize-style AI options (NSFW, describe, classify method).
+        # When set, these override the settings passed to get_analyzer()
+        # so the rename dialog can mirror the Organize page exactly.
+        self._organize_options = dict(organize_options or {})
         # Bounded LRU of per-file tag results, keyed by path.
         # Lets a single batch reuse the result for the same path
         # without re-running the model. Bypassed when force_reprocess.
@@ -903,6 +916,45 @@ class AIRenamer:
             return [], None
         return tags, subject
 
+    def _organize_detect(self, path: str, category: Optional[str]) -> Tuple[List[str], Optional[str]]:
+        """Detect tags using the EXACT same pipeline as the Organize page.
+
+        Steps mirror `_classify_worker` in `organize.py`:
+          1. Extract a video/animated frame if needed.
+          2. Build the analyzer for the selected mode (lowlevel/clip/fusion/ollama)
+             with the Organize-style AI options (NSFW, describe, classify, ...).
+          3. Run `analyzer.analyze()` to produce the full profile.
+          4. Call `_detect_tags_for_file()` to extract the same (tags, subject)
+             tuple that the organize pipeline uses for tag-based rename.
+        """
+        try:
+            from .organize import _detect_tags_for_file, _extract_frame_if_video
+        except Exception as import_err:
+            self._emit("organize_err", f"Could not import organize helpers: {import_err}")
+            return [], None
+
+        analyzer = self._ensure_analyzer()
+        if analyzer is None:
+            return get_tags_for_file(path, category=category, max_tags=self.max_tags)
+
+        analyze_path, is_temp = _extract_frame_if_video(path)
+        try:
+            profile = analyzer.analyze(analyze_path)
+        except Exception as e:
+            self._emit("organize_err", f"{os.path.basename(path)}: {e}")
+            return [], None
+        finally:
+            if is_temp and os.path.exists(analyze_path):
+                try:
+                    os.remove(analyze_path)
+                except Exception:
+                    pass
+
+        if category:
+            profile["_current_category"] = category
+        tags, subject = _detect_tags_for_file(path, profile)
+        return tags, subject
+
     # ---------------- combined registry-aware classifier ----------------
 
     # Tag tokens that describe *colour only* — they don't carry any
@@ -1062,6 +1114,26 @@ class AIRenamer:
 
     # ---------------- analyzer lifecycle ----------------
 
+    def _organize_settings(self) -> Dict:
+        """Build a settings snapshot for the analyzer.
+
+        Merges the user's saved settings with any Organize-style AI
+        options overridden by the caller (NSFW, describe, classify, ...)
+        and the explicitly selected model.
+        """
+        from . import settings as _settings
+        cfg = _settings.load_settings()
+        cfg.update(self._organize_options)
+        requested = self.mode if self.mode != "auto" else cfg.get(
+            "organize_mode", "lowlevel")
+        requested = requested if requested in AI_TAG_MODES else "lowlevel"
+        if self.model:
+            if requested == "ollama":
+                cfg["ollama_model"] = self.model
+            elif requested == "clip":
+                cfg["clip_model"] = self.model
+        return cfg, requested
+
     def _ensure_analyzer(self):
         """Lazily build the analyzer used for content-aware tag detection.
 
@@ -1072,12 +1144,8 @@ class AIRenamer:
         if self._analyzer is not None:
             return self._analyzer
         try:
-            from . import settings as _settings
             from .analyzers import get_analyzer
-            cfg = _settings.load_settings()
-            requested = self.mode if self.mode != "auto" else cfg.get(
-                "organize_mode", "lowlevel")
-            requested = requested if requested in AI_TAG_MODES else "lowlevel"
+            cfg, requested = self._organize_settings()
             self._analyzer = get_analyzer(requested, cfg)
             self._analyzer_mode_resolved = requested
             self._emit("analyzer_init", f"Analyzer ready ({requested})")
@@ -1122,6 +1190,11 @@ class AIRenamer:
                 tags, subject = self._clip_detect(path)
                 if not tags and not subject:
                     self._emit("fallback", "CLIP returned no tags")
+            elif backend == "organize":
+                # Exact Organize-page pipeline: analyzer + _detect_tags_for_file.
+                tags, subject = self._organize_detect(path, category)
+                if not tags and not subject:
+                    self._emit("fallback", "Organize pipeline returned no tags")
             elif backend == "heuristic":
                 # Heuristic = analyzer content heuristics (no AI model).
                 # The combined classifier is the "all project tags" path
@@ -1208,6 +1281,7 @@ def ai_detect_tags(
     model: Optional[str] = None,
     progress_cb=None,
     mode: str = "auto",
+    organize_options: Optional[Dict] = None,
 ) -> Tuple[List[str], Optional[str]]:
     """Single-file AI tag detection (uses a temporary AIRenamer).
 
@@ -1218,11 +1292,16 @@ def ai_detect_tags(
         mode: analyzer mode ("auto"/"lowlevel"/"fusion"/"clip"/"ollama").
             Default "auto" picks up the user's configured `organize_mode`
             so the rename uses the same analyzer that picked the category.
+        organize_options: Organize-style AI option overrides (NSFW,
+            describe, classify, classify_method) used when backend="organize".
     """
     global _AIRENAMER_GLOBAL_CB
     _AIRENAMER_GLOBAL_CB = progress_cb
     try:
-        ren = AIRenamer(backend=backend, mode=mode, model=model, max_tags=max_tags)
+        ren = AIRenamer(
+            backend=backend, mode=mode, model=model, max_tags=max_tags,
+            organize_options=organize_options,
+        )
         try:
             return ren.detect_tags(image_path, category=category)
         finally:
@@ -1244,6 +1323,7 @@ def ai_compute_renames(
     progress_cb=None,
     force_reprocess: bool = False,
     mode: str = "auto",
+    organize_options: Optional[Dict] = None,
 ) -> List[Tuple[str, str]]:
     """Build rename pairs using AI-detected tags.
 
@@ -1258,6 +1338,8 @@ def ai_compute_renames(
             so the rename uses the same analyzer that picked the category.
         force_reprocess: bypass the per-file cache and re-detect every
             image even if it was already processed in this batch.
+        organize_options: Organize-style AI option overrides (NSFW,
+            describe, classify, classify_method) used when backend="organize".
     """
     needs_tags = strategy in TAG_BASED_STRATEGIES
     if not needs_tags:
@@ -1269,6 +1351,7 @@ def ai_compute_renames(
     ren = AIRenamer(
         backend=backend, mode=mode, model=model, max_tags=max_tags,
         force_reprocess=force_reprocess,
+        organize_options=organize_options,
     )
     try:
         tags_by_file: Dict[str, List[str]] = {}

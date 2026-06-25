@@ -1,31 +1,27 @@
 """AI-powered rename dialog.
 
-Lets the user pick an AI backend (CLIP / Ollama / Heuristic / Auto),
-a rename strategy, and apply the rename to all currently
-visible/selected files.
+Mirrors the Organize page AI workflow:
+  * Pick an analysis mode (Low-Level CV / CLIP / CLIP + LowLevel / Ollama).
+  * Toggle AI options (NSFW detection, description → tags,
+    direct classification, classify by tags/prompt).
+  * Pick a model when mode is CLIP or Ollama.
+  * Run preview, inspect, apply.
 
 UX principles
 --------------
 * No auto-preview on open — the dialog opens with a clear "Run preview"
-  button. The user configures backend + strategy first, then triggers
+  button. The user configures mode + options first, then triggers
   preview when ready.
-* No auto-refresh on settings change — adjusting the backend or
-  strategy does NOT immediately re-run tag detection. The preview
+* No auto-refresh on settings change — adjusting the mode or
+  options does NOT immediately re-run tag detection. The preview
   reflects the *latest* result; the user clicks "Refresh preview" to
   re-run with the new settings.
 * Cancel/Stop button while preview is running so the user can abort
-  a slow run.
+  a slow run without closing the dialog.
 * Memory-conscious: the CLIP vocabulary is capped (see ``rename._clip_tag_vocab``)
   and tensors are freed after each file.
 * Limit input: a "Preview only the first N files" spinner keeps the
   dialog responsive on huge selections.
-
-The dialog is backend-aware:
-  * Auto   — tries Ollama → CLIP → heuristic, picks the first that
-    responds.
-  * CLIP   — uses the local OpenAI CLIP model + curated tag vocabulary.
-  * Ollama — uses the configured local vision LLM.
-  * Heuristic — pure CV pipeline (no AI), still useful as a fallback.
 """
 import os
 from typing import List, Optional, Tuple
@@ -37,8 +33,9 @@ from PySide6.QtWidgets import (
     QGroupBox, QFormLayout, QSpinBox, QCheckBox, QMessageBox, QProgressBar,
 )
 
+from .. import settings as s
 from ..rename import (
-    RENAME_STRATEGIES, TAG_BASED_STRATEGIES, AI_TAG_BACKENDS, AI_TAG_MODES,
+    RENAME_STRATEGIES, TAG_BASED_STRATEGIES,
     ai_compute_renames, apply_renames,
 )
 
@@ -116,22 +113,27 @@ class _PreviewJob(QThread):
     refreshes within the same dialog session). Honors an internal
     ``cancel`` flag so the user can stop a slow preview without
     closing the dialog.
+
+    When ``use_organize_pipeline`` is True (the default), the renamer
+    runs the exact same analyzer pipeline as the Organize page:
+    ``get_analyzer(mode, settings)`` + ``_detect_tags_for_file``.
     """
     progress = Signal(int, int, str)         # (cur, total, msg)
     finished_ok = Signal(list, list)         # (pairs, log_lines)
     failed = Signal(str)
 
-    def __init__(self, files, strategy, backend, category, max_tags,
-                 model=None, force_reprocess=False, mode="auto"):
+    def __init__(self, files, strategy, mode, category, max_tags,
+                 model=None, force_reprocess=False,
+                 organize_options=None):
         super().__init__()
         self.files = list(files)
         self.strategy = strategy
-        self.backend = backend
+        self.mode = mode
         self.category = category
         self.max_tags = max_tags
         self.model = model
         self.force_reprocess = force_reprocess
-        self.mode = mode
+        self.organize_options = organize_options or {}
         self._cancel = False
         # Filled in by run(); used by the slot to surface per-file stats.
         self.renamer: Optional[object] = None
@@ -145,11 +147,12 @@ class _PreviewJob(QThread):
 
             log: List[str] = []
             ren = AIRenamer(
-                backend=self.backend,
+                backend="organize",
                 mode=self.mode,
                 model=self.model,
                 max_tags=self.max_tags,
                 force_reprocess=self.force_reprocess,
+                organize_options=self.organize_options,
             )
             self.renamer = ren
 
@@ -157,8 +160,7 @@ class _PreviewJob(QThread):
             total = len(self.files)
             self.progress.emit(
                 0, total,
-                f"Processing {total} files with {self.backend}"
-                f" (mode={self.mode})…",
+                f"Processing {total} files with mode={self.mode}",
             )
 
             # Iterate per-file so we can emit granular progress events.
@@ -206,10 +208,24 @@ class _PreviewJob(QThread):
 class AIRenameDialog(QDialog):
     """Dialog: AI tag detection + rename preview + apply.
 
+    Mirrors the Organize page AI workflow:
+      * Pick an analysis mode (Low-Level CV / CLIP / Fusion / Ollama).
+      * Toggle AI options (NSFW detection, description → tags,
+        direct classification, classify by tags/prompt).
+      * Pick a model when mode is CLIP or Ollama.
+      * Click "Run preview" to compute the rename plan.
+
     The dialog never starts tag detection on its own. The user picks a
-    backend, a strategy, and an optional preview cap, then explicitly
-    clicks "Run preview" to compute the rename plan.
+    mode and options, then explicitly clicks "Run preview".
     """
+
+    # Legacy backend -> Organize mode mapping.
+    _LEGACY_BACKEND_MAP = {
+        "auto": "auto",
+        "heuristic": "lowlevel",
+        "clip": "clip",
+        "ollama": "ollama",
+    }
 
     def __init__(self, files: List[str], category: str = "",
                  default_backend: str = "auto",
@@ -217,11 +233,20 @@ class AIRenameDialog(QDialog):
                  max_tags: int = 3,
                  preview_limit: int = 50,
                  default_model: Optional[str] = None,
+                 nsfw: bool = True,
+                 describe: bool = False,
+                 classify: bool = False,
+                 classify_method: str = "tags",
                  parent=None):
         super().__init__(parent)
         self.files = list(files)
         self.category = category
         self._default_model = default_model
+        self._nsfw = nsfw
+        self._describe = describe
+        self._classify = classify
+        self._classify_method = classify_method
+        self._mode = self._resolve_mode(default_backend)
         self._pairs: List[Tuple[str, str]] = []
         self._preview_job: Optional[_PreviewJob] = None
         self._has_preview = False
@@ -230,13 +255,23 @@ class AIRenameDialog(QDialog):
         self._force_reprocess = True
         self.setWindowTitle(f"AI Rename — {len(self.files)} files")
         self.setMinimumSize(840, 720)
-        self._build(default_backend, default_strategy, max_tags, preview_limit)
+        self._build(default_strategy, max_tags, preview_limit)
         # NOTE: we intentionally do NOT auto-run preview here. The user
         # explicitly clicks "Run preview" once the settings are right.
 
+    def _resolve_mode(self, backend: str) -> str:
+        """Map a legacy backend string to an Organize analysis mode."""
+        cfg = s.load_settings()
+        mode = self._LEGACY_BACKEND_MAP.get(backend, backend)
+        if mode == "auto":
+            mode = cfg.get("organize_mode", "lowlevel")
+        if mode not in ("lowlevel", "clip", "fusion", "ollama"):
+            mode = "lowlevel"
+        return mode
+
     # -------- BUILD --------
 
-    def _build(self, default_backend, default_strategy, max_tags, preview_limit):
+    def _build(self, default_strategy, max_tags, preview_limit):
         l = QVBoxLayout(self)
         l.setContentsMargins(16, 16, 16, 16)
         l.setSpacing(10)
@@ -249,75 +284,33 @@ class AIRenameDialog(QDialog):
             sub.setObjectName("subtitle")
             l.addWidget(sub)
 
-        # ---- Backend selector ----
-        bg = QGroupBox("AI backend")
+        # ---- Analysis mode selector (same as Organize page) ----
+        bg = QGroupBox("Analysis Mode")
         bg_layout = QFormLayout(bg)
-        self._backend = QComboBox()
-        labels = {
-            "auto":      "Auto (CLIP → Ollama → Analyzer — recommended)",
-            "heuristic": "Analyzer (same as category assignment, no AI)",
-            "clip":      "CLIP (local OpenAI model — semantic match against registry)",
-            "ollama":    "Ollama (local vision LLM)",
-        }
-        for k in AI_TAG_BACKENDS:
-            self._backend.addItem(labels.get(k, k), k)
-        # Default to "auto" so the user gets AI-driven semantic tag
-        # detection against the full registry (CLIP if installed,
-        # Ollama otherwise). This matches the user's explicit request:
-        # "use AI to use the available tags and classify the images".
-        idx = self._backend.findData(default_backend)
-        if idx < 0:
-            idx = self._backend.findData("auto")
+        self._mode_combo = QComboBox()
+        mode_items = [
+            ("lowlevel", "Low-Level CV (edges, textures, shapes, HOG)"),
+            ("clip", "CLIP (vision-language model)"),
+            ("fusion", "CLIP + LowLevel (fusion, recommended)"),
+            ("ollama", "Ollama (local vision LLM)"),
+        ]
+        for key, label in mode_items:
+            self._mode_combo.addItem(label, key)
+        idx = self._mode_combo.findData(self._mode)
         if idx >= 0:
-            self._backend.setCurrentIndex(idx)
-        self._backend.currentIndexChanged.connect(self._on_backend_changed)
-        bg_layout.addRow("Backend:", self._backend)
+            self._mode_combo.setCurrentIndex(idx)
+        self._mode_desc = QLabel("")
+        self._mode_desc.setObjectName("statSmall")
+        bg_layout.addRow("Mode:", self._mode_combo)
+        bg_layout.addRow("", self._mode_desc)
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
-        # ---- Backend status (CLIP / Ollama availability) ----
-        # The user needs to see which AI backends are actually wired up
-        # so they know why the auto cascade picks the path it does.
-        self._backend_status = QLabel("")
-        self._backend_status.setObjectName("statSmall")
-        self._backend_status.setStyleSheet("color: #888;")
-        self._backend_status.setWordWrap(True)
-        bg_layout.addRow("Status:", self._backend_status)
-        self._refresh_backend_status()
-
-        # ---- Analyzer mode ----
-        # When the cascade falls back to the analyzer (last resort) or
-        # when "heuristic" is picked explicitly, this dropdown picks
-        # WHICH analyzer runs. Default "auto" uses the configured
-        # `organize_mode` from settings.
-        self._mode = QComboBox()
-        mode_labels = {
-            "auto":     "Auto (use configured organize mode)",
-            "lowlevel": "LowLevel CV (no AI, pure heuristics)",
-            "fusion":   "Fusion (CLIP + LowLevel — best quality)",
-            "clip":     "CLIP zero-shot (vision-language)",
-            "ollama":   "Ollama vision LLM (most expensive)",
-        }
-        for k in AI_TAG_MODES:
-            self._mode.addItem(mode_labels.get(k, k), k)
-        self._mode.setCurrentIndex(0)  # auto
-        self._mode.setToolTip(
-            "Analyzer the rename backend uses as the last-resort fallback.\n"
-            "Only used when no AI backend (CLIP/Ollama) is available.\n"
-            "  Auto   - same analyzer configured for organising\n"
-            "  Fusion - CLIP + LowLevel (recommended when CLIP is loaded)\n"
-            "  CLIP   - CLIP zero-shot only (no CV heuristics)\n"
-            "  LowLevel - classical CV only, no AI model\n"
-            "  Ollama - local vision LLM"
-        )
-        bg_layout.addRow("Analyzer fallback:", self._mode)
-
-        # Model selector — visible only for backends that need it.
-        # When "auto" is picked, the model field is disabled (we use
-        # whatever is configured for each backend as we cascade).
+        # Model selector — visible only for CLIP / Ollama modes.
         self._model_combo = QComboBox()
         self._model_combo.setEditable(True)
         self._model_combo.setMinimumWidth(180)
         self._model_combo.setToolTip(
-            "Pick the specific model the selected backend should use. "
+            "Pick the specific model the selected mode should use. "
             "Leave on '(configured)' to use the active model from settings."
         )
         bg_layout.addRow("Model:", self._model_combo)
@@ -327,7 +320,44 @@ class AIRenameDialog(QDialog):
         self._model_refresh_btn.clicked.connect(self._refresh_model_list)
         bg_layout.addRow("", self._model_refresh_btn)
 
+        # Status label showing whether the selected mode is available.
+        self._backend_status = QLabel("")
+        self._backend_status.setObjectName("statSmall")
+        self._backend_status.setStyleSheet("color: #888;")
+        self._backend_status.setWordWrap(True)
+        bg_layout.addRow("Status:", self._backend_status)
+
         l.addWidget(bg)
+
+        # ---- AI Options (same as Organize page) ----
+        self._ai_opts = QGroupBox("AI Options")
+        ai_l = QVBoxLayout(self._ai_opts)
+        self._cb_nsfw = QCheckBox("AI NSFW detection")
+        self._cb_nsfw.setChecked(self._nsfw)
+        ai_l.addWidget(self._cb_nsfw)
+        ar = QHBoxLayout()
+        self._cb_describe = QCheckBox("AI description -> tags")
+        self._cb_describe.setChecked(self._describe)
+        self._cb_classify = QCheckBox("AI direct classification")
+        self._cb_classify.setChecked(self._classify)
+        ar.addWidget(self._cb_describe)
+        ar.addWidget(self._cb_classify)
+        ar.addStretch()
+        ai_l.addLayout(ar)
+        # Classification method toggle (tags vs prompt)
+        meth_l = QHBoxLayout()
+        meth_l.addWidget(QLabel("Classify by:"))
+        self._classify_method_combo = QComboBox()
+        self._classify_method_combo.addItem("Tags (IA sugiere tags, sistema elige categoria)", "tags")
+        self._classify_method_combo.addItem("Prompt (IA elige categoria directamente)", "prompt")
+        idx = self._classify_method_combo.findData(self._classify_method)
+        if idx >= 0:
+            self._classify_method_combo.setCurrentIndex(idx)
+        meth_l.addWidget(self._classify_method_combo, 1)
+        meth_l.addStretch()
+        ai_l.addLayout(meth_l)
+        self._ai_opts.setVisible(self._mode in ("clip", "fusion", "ollama"))
+        l.addWidget(self._ai_opts)
 
         # ---- Strategy + options ----
         sg = QGroupBox("Rename strategy")
@@ -432,7 +462,7 @@ class AIRenameDialog(QDialog):
         l.addLayout(bb)
 
         self._on_strategy_changed()
-        self._on_backend_changed()
+        self._on_mode_changed()
         self._update_warning()
 
     # -------- warning / size check --------
@@ -440,15 +470,15 @@ class AIRenameDialog(QDialog):
     def _update_warning(self):
         """Show a warning when the file count is large enough to be slow."""
         n = len(self.files)
-        backend = self._backend.currentData()
+        mode = self._mode_combo.currentData()
         warn_text = ""
-        if backend in ("ollama", "auto") and n > 10:
+        if mode == "ollama" and n > 10:
             est = n * 5  # rough: 5s per image via Ollama
             warn_text = (
                 f"⚠ {n} files via Ollama may take a few minutes "
                 f"(~{est}s). Consider Preview limit + Dry run."
             )
-        elif backend == "clip" and n > 100:
+        elif mode in ("clip", "fusion") and n > 100:
             warn_text = (
                 f"⚠ {n} files via CLIP — preview limit recommended to "
                 f"keep memory in check."
@@ -466,97 +496,108 @@ class AIRenameDialog(QDialog):
 
     # -------- behaviour --------
 
-    def _on_backend_changed(self):
-        b = self._backend.currentData()
-        # Populate the model dropdown with backend-appropriate entries.
-        self._populate_model_combo(b)
-        if b == "ollama":
+    def _on_mode_changed(self):
+        mode = self._mode_combo.currentData()
+        is_ai = mode in ("clip", "fusion", "ollama")
+        self._ai_opts.setVisible(is_ai)
+        # Populate the model dropdown with mode-appropriate entries.
+        self._populate_model_combo(mode)
+        if mode == "ollama":
             self._model_combo.setEnabled(True)
             self._model_refresh_btn.setEnabled(True)
-            self._backend_status.setText(
-                "Ollama runs locally. Pick a vision model below — every "
-                "file will be tagged with that specific model."
-            )
-        elif b == "clip":
-            self._model_combo.setEnabled(True)
-            self._model_refresh_btn.setEnabled(True)
-            self._backend_status.setText(
-                "CLIP encodes the image and scores it against the full "
-                "tag registry. Pick the specific CLIP variant below."
-            )
-        elif b == "heuristic":
-            self._model_combo.setEnabled(False)
-            self._model_refresh_btn.setEnabled(False)
-            self._backend_status.setText(
-                "Analyzer pipeline (same as category assignment). "
-                "No AI model — tags come from CV heuristics + content "
-                "detectors (anime/cyberpunk/portrait/...) when their "
-                "signals fire. Best when no CLIP/Ollama is available."
-            )
-        else:  # auto
-            self._model_combo.setEnabled(False)
-            self._model_refresh_btn.setEnabled(False)
             self._refresh_backend_status()
+        elif mode == "clip":
+            self._model_combo.setEnabled(True)
+            self._model_refresh_btn.setEnabled(True)
+            self._refresh_backend_status()
+        elif mode == "fusion":
+            self._model_combo.setEnabled(True)
+            self._model_refresh_btn.setEnabled(True)
+            self._backend_status.setText(
+                "Fusion runs LowLevel CV + CLIP. Pick the CLIP model below."
+            )
+        else:  # lowlevel
+            self._model_combo.setEnabled(False)
+            self._model_refresh_btn.setEnabled(False)
+            self._backend_status.setText(
+                "Low-Level CV analyzer (no AI model). Tags come from "
+                "classical computer-vision heuristics + content detectors."
+            )
+        self._update_mode_desc()
         self._update_warning()
         self._apply_btn.setEnabled(self._has_preview)
 
-    def _refresh_backend_status(self):
-        """Probe CLIP and Ollama availability for the auto cascade."""
-        if self._backend.currentData() != "auto":
-            return
-        # CLIP availability probe (no model load — just check the engine).
-        clip_ok = False
-        clip_msg = ""
-        try:
-            from ..clip_client import get_engine
-            engine = get_engine()
-            clip_ok = bool(engine.available)
-        except Exception as e:
-            clip_msg = f" ({e})"
-        # Ollama availability probe.
-        ollama_ok = False
-        try:
-            from .. import settings as _s
-            from ..ollama_client import OllamaClient
-            cfg = _s.load_settings()
-            client = OllamaClient(
-                base_url=cfg.get("ollama_url", "http://localhost:11434"),
-                timeout=2,
-            )
-            try:
-                ollama_ok = bool(client.list_models())
-            finally:
-                client.close()
-        except Exception:
-            ollama_ok = False
+    def _update_mode_desc(self):
+        descs = {
+            "lowlevel": "Classical CV: edge detection, texture, silhouette, HOG, Fourier",
+            "clip": "OpenAI CLIP zero-shot: semantic understanding",
+            "fusion": "CLIP semantic + LowLevel CV statistics - best of both",
+            "ollama": "Local vision LLM via Ollama",
+        }
+        self._mode_desc.setText(descs.get(self._mode_combo.currentData(), ""))
 
-        cascade = []
-        if clip_ok:
-            cascade.append("CLIP")
-        if ollama_ok:
-            cascade.append("Ollama")
-        cascade.append("Analyzer")
-        chain = " → ".join(cascade)
-        if clip_ok:
-            self._backend_status.setText(
-                f"Auto cascade: {chain}. "
-                "CLIP will score each image against the full registry "
-                "and pick the top-K most relevant tags.{oll}".format(
-                    oll=("" if ollama_ok else " Ollama server not reachable.")
+    def _refresh_backend_status(self):
+        """Probe CLIP or Ollama availability for the selected mode."""
+        mode = self._mode_combo.currentData()
+        if mode == "clip":
+            try:
+                from ..clip_client import get_engine
+                engine = get_engine()
+                clip_ok = bool(engine.available)
+            except Exception as e:
+                clip_ok = False
+            if clip_ok:
+                self._backend_status.setText(
+                    "✓ CLIP engine available. "
+                    "Will score each image against the full tag registry."
                 )
-            )
-        elif ollama_ok:
-            self._backend_status.setText(
-                f"Auto cascade: {chain}. CLIP not loaded — Ollama "
-                "will be used (slower, vision LLM)."
-            )
-        else:
-            self._backend_status.setText(
-                f"Auto cascade: {chain}. No AI backend available — "
-                "will fall back to analyzer content heuristics. "
-                "Install CLIP (`pip install git+https://github.com/openai/CLIP.git`) "
-                "or start Ollama for AI-driven semantic tagging."
-            )
+                self._backend_status.setStyleSheet("color: #6fbf73;")
+            else:
+                self._backend_status.setText(
+                    "✗ CLIP not loaded. Install CLIP or pick a different mode."
+                )
+                self._backend_status.setStyleSheet("color: #c95;")
+        elif mode == "ollama":
+            try:
+                from ..ollama_client import OllamaClient
+                cfg = s.load_settings()
+                client = OllamaClient(
+                    base_url=cfg.get("ollama_url", "http://localhost:11434"),
+                    timeout=2,
+                )
+                try:
+                    ollama_ok = bool(client.list_models())
+                finally:
+                    client.close()
+            except Exception:
+                ollama_ok = False
+            if ollama_ok:
+                self._backend_status.setText(
+                    "✓ Ollama server reachable. Pick a vision model below."
+                )
+                self._backend_status.setStyleSheet("color: #6fbf73;")
+            else:
+                self._backend_status.setText(
+                    "✗ Ollama server not reachable. Start Ollama or pick a different mode."
+                )
+                self._backend_status.setStyleSheet("color: #c95;")
+        elif mode == "fusion":
+            try:
+                from ..clip_client import get_engine
+                engine = get_engine()
+                clip_ok = bool(engine.available)
+            except Exception:
+                clip_ok = False
+            if clip_ok:
+                self._backend_status.setText(
+                    "✓ CLIP available — Fusion will use CLIP + LowLevel CV."
+                )
+                self._backend_status.setStyleSheet("color: #6fbf73;")
+            else:
+                self._backend_status.setText(
+                    "CLIP not loaded — Fusion will fall back to LowLevel CV only."
+                )
+                self._backend_status.setStyleSheet("color: #c95;")
 
     def _on_strategy_changed(self):
         strat = self._strat.currentData()
@@ -565,19 +606,18 @@ class AIRenameDialog(QDialog):
 
     # -------- model dropdown --------
 
-    def _populate_model_combo(self, backend: str):
-        """Fill the model combo with entries appropriate for `backend`."""
+    def _populate_model_combo(self, mode: str):
+        """Fill the model combo with entries appropriate for `mode`."""
         prev = self._model_combo.currentText() if self._model_combo.count() else ""
         self._model_combo.blockSignals(True)
         try:
             self._model_combo.clear()
-            if backend == "clip":
+            if mode == "clip" or mode == "fusion":
                 models = _list_clip_models()
                 # Use the configured active CLIP model by default.
                 if not self._default_model:
                     try:
-                        from .. import settings as _s
-                        self._default_model = _s.load_settings().get("clip_model")
+                        self._default_model = s.load_settings().get("clip_model")
                     except Exception:
                         pass
                 self._model_combo.addItem("(configured)", "")
@@ -592,12 +632,11 @@ class AIRenameDialog(QDialog):
                     idx = self._model_combo.findText(target)
                 if idx >= 0:
                     self._model_combo.setCurrentIndex(idx)
-            elif backend == "ollama":
+            elif mode == "ollama":
                 models = _list_ollama_models()
                 if not self._default_model:
                     try:
-                        from .. import settings as _s
-                        self._default_model = _s.load_settings().get("ollama_model")
+                        self._default_model = s.load_settings().get("ollama_model")
                     except Exception:
                         pass
                 self._model_combo.addItem("(configured)", "")
@@ -620,8 +659,8 @@ class AIRenameDialog(QDialog):
 
     def _refresh_model_list(self):
         """Re-query CLIP/Ollama and rebuild the dropdown."""
-        backend = self._backend.currentData()
-        self._populate_model_combo(backend)
+        mode = self._mode_combo.currentData()
+        self._populate_model_combo(mode)
         # Briefly tell the user we updated the list.
         prev = self._backend_status.text()
         self._backend_status.setText(prev + "  •  model list refreshed")
@@ -642,16 +681,22 @@ class AIRenameDialog(QDialog):
             self._preview_job.cancel()
             self._preview_job.wait(500)
         strat = self._strat.currentData()
-        backend = self._backend.currentData()
+        mode = self._mode_combo.currentData()
         cap = int(self._preview_limit.value())
         files_to_process = self.files[:cap]
         # Pull the explicit model selection (None means "use whatever's
         # configured") so the user can pick a specific model per-rename.
         model = self._selected_model()
-        if model:
-            backend_label = f"{backend} ({model})"
-        else:
-            backend_label = backend
+        # Build Organize-style AI option overrides.
+        organize_options = {}
+        if mode in ("clip", "fusion", "ollama"):
+            organize_options["ollama_nsfw_enabled"] = self._cb_nsfw.isChecked()
+            organize_options["ollama_describe_enabled"] = self._cb_describe.isChecked()
+            organize_options["ollama_classify_enabled"] = self._cb_classify.isChecked()
+            organize_options["ollama_classify_method"] = (
+                self._classify_method_combo.currentData() or "tags"
+            )
+        mode_label = mode + (f" ({model})" if model else " / (configured)")
         self._prog.setVisible(True)
         self._prog.setRange(0, len(files_to_process))
         self._prog.setValue(0)
@@ -659,17 +704,17 @@ class AIRenameDialog(QDialog):
         self._stop_btn.setEnabled(True)
         self._apply_btn.setEnabled(False)
         self._backend_status.setText(
-            f"Running preview with backend={backend_label} on {len(files_to_process)} files…"
+            f"Running preview with mode={mode_label} on {len(files_to_process)} files…"
         )
         self._preview_job = _PreviewJob(
             files=files_to_process,
             strategy=strat,
-            backend=backend,
+            mode=mode,
             category=self.category,
             max_tags=self._max_tags.value(),
             model=model,
             force_reprocess=self._force_reprocess,
-            mode=self._mode.currentData() or "auto",
+            organize_options=organize_options,
         )
         self._preview_job.progress.connect(self._on_preview_progress)
         self._preview_job.finished_ok.connect(self._on_preview_done)
@@ -693,9 +738,9 @@ class AIRenameDialog(QDialog):
         self._has_preview = True
         self._apply_btn.setEnabled(bool(self._pairs))
         self._refresh_table()
-        backend = self._backend.currentData()
+        mode = self._mode_combo.currentData()
         model = self._selected_model()
-        label = backend + (f" / {model}" if model else " / (configured)")
+        label = mode + (f" / {model}" if model else " / (configured)")
         # Surface AIRenamer stats (processed / cached / failed) so the
         # user knows how many files were retagged vs served from cache
         # vs failed outright.

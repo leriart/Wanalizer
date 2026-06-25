@@ -331,11 +331,12 @@ class ThumbWorker(QThread):
 class _RenameJob(QThread):
     """Background worker: compute rename pairs and apply them.
 
-    For tag-based strategies, tags are detected via the AI combined
-    classifier (CLIP → analyzer → suggest_tags) by default — the same
-    pipeline used by the AI Rename dialog. This guarantees that the
-    "Rename on move" and "Rename only" buttons in the Reorder page
-    produce content-aware filenames, not colour-only ones.
+    For tag-based strategies, tags are detected using the exact same
+    Organize-page pipeline selected in the Reorder header: the analyzer
+    mode (lowlevel / clip / fusion / ollama) plus the Organize-style AI
+    options (NSFW, describe, classify, classify_method). This guarantees
+    that "Rename on move" produces the same content-aware filenames as
+    the Organize pass.
 
     Non-tag strategies (sequential, category, hash, ...) skip AI work
     entirely.
@@ -350,7 +351,8 @@ class _RenameJob(QThread):
     failed = Signal(str)
 
     def __init__(self, paths, target_dir, strategy, category, max_tags,
-                 ai_backend="auto", ai_mode="auto", ai_model=None):
+                 ai_backend="auto", ai_mode="auto", ai_model=None,
+                 organize_options=None):
         super().__init__()
         self.paths = list(paths)
         self.target_dir = target_dir  # None for in-place rename
@@ -360,6 +362,7 @@ class _RenameJob(QThread):
         self.ai_backend = ai_backend or "auto"
         self.ai_mode = ai_mode or "auto"
         self.ai_model = ai_model or None
+        self.organize_options = organize_options or {}
 
     def run(self):
         try:
@@ -372,6 +375,7 @@ class _RenameJob(QThread):
                 ai_backend=self.ai_backend,
                 ai_mode=self.ai_mode,
                 ai_model=self.ai_model,
+                organize_options=self.organize_options,
                 on_progress=lambda cur, total: self.progress.emit(cur, total),
             )
             self.finished_ok.emit(result)
@@ -381,7 +385,7 @@ class _RenameJob(QThread):
 
 def _execute_rename_job(paths, target_dir, strategy, category, max_tags,
                         ai_backend="auto", ai_mode="auto", ai_model=None,
-                        on_progress=None) -> Dict:
+                        organize_options=None, on_progress=None) -> Dict:
     """Core rename-job logic, split out so it can be tested without QThread.
 
     Returns a dict with:
@@ -407,6 +411,7 @@ def _execute_rename_job(paths, target_dir, strategy, category, max_tags,
             model=ai_model,
             max_tags=max_tags,
             force_reprocess=False,
+            organize_options=organize_options,
         )
         try:
             total = len(paths)
@@ -746,23 +751,24 @@ class ReorganizePage(QWidget):
             " border-bottom: 1px solid #1a1a1a; border-radius: 0;"
             " padding: 0px; }"
         )
-        rnl = QHBoxLayout(rn)
+        rnl = QVBoxLayout(rn)
         rnl.setContentsMargins(24, 4, 24, 8)
-        rnl.setSpacing(10)
+        rnl.setSpacing(6)
 
-        rnl.addWidget(QLabel("Strategy:"))
+        # First row: rename strategy + prefix + max tags.
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
+        row1.addWidget(QLabel("Strategy:"))
         self._rename_strat = QComboBox()
         self._rename_strat.setMinimumWidth(220)
         for key, label, desc in RENAME_STRATEGIES:
             self._rename_strat.addItem(f"{label}  —  {desc}", key)
         self._rename_strat.setCurrentIndex(1)  # default to "By category"
         self._rename_strat.setToolTip(
-            "How files are named when 'Rename on move' is enabled "
-            "or when using the 'Rename only' button. Tag-based strategies "
-            "auto-detect content using the heuristic CV pipeline."
+            "How files are named when 'Rename on move' is enabled."
         )
         self._rename_strat.currentIndexChanged.connect(self._on_rename_strat_changed)
-        rnl.addWidget(self._rename_strat)
+        row1.addWidget(self._rename_strat)
 
         self._cb_rename_prefix = QCheckBox("Use category as prefix")
         self._cb_rename_prefix.setChecked(True)
@@ -770,9 +776,9 @@ class ReorganizePage(QWidget):
             "For the 'category' strategy: prefix the category name to the "
             "new filename (e.g. Anime_001.jpg)."
         )
-        rnl.addWidget(self._cb_rename_prefix)
+        row1.addWidget(self._cb_rename_prefix)
 
-        rnl.addWidget(QLabel("Max tags:"))
+        row1.addWidget(QLabel("Max tags:"))
         self._max_tags = QSpinBox()
         self._max_tags.setRange(1, 8)
         self._max_tags.setValue(3)
@@ -781,52 +787,47 @@ class ReorganizePage(QWidget):
             "strategies. More tags = longer filenames."
         )
         self._max_tags.valueChanged.connect(lambda _v: self._refresh_rename_buttons())
-        rnl.addWidget(self._max_tags)
+        row1.addWidget(self._max_tags)
 
-        # AI backend selector — visible only for tag-based strategies.
-        # Uses the same combined classifier (CLIP → analyzer → suggest_tags)
-        # as the AI Rename dialog so the "Rename on move" / "Rename only"
-        # buttons produce content-aware filenames.
-        self._ai_backend_label = QLabel("AI backend:")
-        rnl.addWidget(self._ai_backend_label)
-        self._ai_backend = QComboBox()
-        from ... import rename as _rename_compat
-        _AI_BACKEND_OPTIONS = (
-            ("auto",      "Auto (CLIP → Ollama → Analyzer)"),
-            ("clip",      "CLIP (semantic match against tag registry)"),
-            ("ollama",    "Ollama (local vision LLM)"),
-            ("heuristic", "Analyzer (same as category assignment, no AI)"),
-        )
-        for key, label in _AI_BACKEND_OPTIONS:
-            self._ai_backend.addItem(label, key)
-        self._ai_backend.setCurrentIndex(0)  # auto
-        self._ai_backend.setToolTip(
-            "AI backend used to detect content tags for tag-based rename "
-            "strategies. Auto (default) tries CLIP first (matches against "
-            "the full tag registry), falls back to Ollama, then the analyzer."
-        )
-        self._ai_backend.currentIndexChanged.connect(
-            lambda _i: self._refresh_ai_status()
-        )
-        rnl.addWidget(self._ai_backend)
+        row1.addStretch()
+        rnl.addLayout(row1)
 
-        # AI model picker — visible only for CLIP / Ollama backends.
-        # Lets the user pin a specific model BEFORE opening the AI
-        # Rename dialog so the dialog opens with the right selection
-        # and doesn't have to be reconfigured after.
+        # Second row: analysis mode + AI options (mirrors Organize page).
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
+
+        row2.addWidget(QLabel("Analysis mode:"))
+        self._ai_mode = QComboBox()
+        self._ai_mode.setMinimumWidth(220)
+        self._ai_mode.addItem("Low-Level CV (edges, textures, shapes, HOG)", "lowlevel")
+        self._ai_mode.addItem("CLIP (vision-language model)", "clip")
+        self._ai_mode.addItem("CLIP + LowLevel (fusion, recommended)", "fusion")
+        self._ai_mode.addItem("Ollama (local vision LLM)", "ollama")
+        cfg = s.load_settings()
+        init_mode = cfg.get("organize_mode", "lowlevel")
+        idx = self._ai_mode.findData(init_mode)
+        if idx >= 0:
+            self._ai_mode.setCurrentIndex(idx)
+        self._ai_mode.setToolTip(
+            "Analysis mode used to detect content tags. Same modes as the Organize page."
+        )
+        self._ai_mode.currentIndexChanged.connect(self._on_ai_mode_changed)
+        row2.addWidget(self._ai_mode)
+
+        self._ai_mode_desc = QLabel("")
+        self._ai_mode_desc.setObjectName("statSmall")
+        row2.addWidget(self._ai_mode_desc, 1)
+
+        # Model picker for CLIP / Ollama.
         self._ai_model_label = QLabel("Model:")
-        rnl.addWidget(self._ai_model_label)
+        row2.addWidget(self._ai_model_label)
         self._ai_model = QComboBox()
         self._ai_model.setEditable(True)
         self._ai_model.setMinimumWidth(140)
         self._ai_model.setToolTip(
-            "Specific AI model to use. Leave on '(configured)' to "
-            "inherit from the AI Models page settings. Only relevant "
-            "for CLIP / Ollama backends."
+            "Specific model to use. Leave on '(configured)' to inherit from settings."
         )
         self._ai_model.addItem("(configured)", None)
-        # Populate with the standard CLIP / Ollama model lists so the
-        # picker has useful defaults even without a network call.
         for m in ("ViT-B/32", "ViT-B/16", "ViT-L/14", "ViT-L/14@336px",
                   "RN50", "RN101", "RN50x4"):
             self._ai_model.addItem(m, m)
@@ -834,35 +835,55 @@ class ReorganizePage(QWidget):
                   "minicpm-v:8b", "moondream:latest"):
             self._ai_model.addItem(m, m)
         self._ai_model.setCurrentIndex(0)
-        self._ai_model.setVisible(False)
-        self._ai_model_label.setVisible(False)
-        # Show the picker when the user picks a backend that takes a model.
-        def _sync_model_picker_visibility():
-            backend = self._ai_backend.currentData()
-            needs_model = backend in ("clip", "ollama")
-            self._ai_model.setVisible(needs_model)
-            self._ai_model_label.setVisible(needs_model)
-        self._ai_backend.currentIndexChanged.connect(
-            lambda _i: _sync_model_picker_visibility()
-        )
-        rnl.addWidget(self._ai_model)
+        row2.addWidget(self._ai_model)
 
-        # Tiny status label next to the AI backend combo showing which
-        # backends are actually wired up. Refreshed when the combo
-        # changes or when the user moves between categories (state may
-        # have changed: e.g. CLIP model loaded between scans).
+        self._model_refresh_btn = QPushButton("Refresh")
+        self._model_refresh_btn.setObjectName("ghost")
+        self._model_refresh_btn.clicked.connect(self._refresh_ai_model_list)
+        row2.addWidget(self._model_refresh_btn)
+
+        # AI Options toggles (mirrors Organize page).
+        self._ai_opts_frame = QFrame()
+        ai_opts_l = QHBoxLayout(self._ai_opts_frame)
+        ai_opts_l.setContentsMargins(0, 0, 0, 0)
+        ai_opts_l.setSpacing(10)
+        self._cb_nsfw = QCheckBox("AI NSFW detection")
+        self._cb_nsfw.setChecked(bool(cfg.get("ollama_nsfw_enabled", True)))
+        ai_opts_l.addWidget(self._cb_nsfw)
+        self._cb_describe = QCheckBox("AI description -> tags")
+        self._cb_describe.setChecked(bool(cfg.get("ollama_describe_enabled", False)))
+        ai_opts_l.addWidget(self._cb_describe)
+        self._cb_classify = QCheckBox("AI direct classification")
+        self._cb_classify.setChecked(bool(cfg.get("ollama_classify_enabled", False)))
+        ai_opts_l.addWidget(self._cb_classify)
+        ai_opts_l.addWidget(QLabel("Classify by:"))
+        self._classify_method = QComboBox()
+        self._classify_method.addItem("Tags", "tags")
+        self._classify_method.addItem("Prompt", "prompt")
+        method = cfg.get("ollama_classify_method", "tags")
+        idx = self._classify_method.findData(method)
+        if idx >= 0:
+            self._classify_method.setCurrentIndex(idx)
+        ai_opts_l.addWidget(self._classify_method)
+        ai_opts_l.addStretch()
+        row2.addWidget(self._ai_opts_frame)
+
         self._ai_status = QLabel("")
         self._ai_status.setObjectName("statSmall")
         self._ai_status.setStyleSheet("color: #888;")
         self._ai_status.setWordWrap(False)
-        rnl.addWidget(self._ai_status)
+        row2.addWidget(self._ai_status)
+
+        row2.addStretch()
+        rnl.addLayout(row2)
 
         self._rename_strategy_hint = QLabel("")
         self._rename_strategy_hint.setObjectName("statSmall")
         self._rename_strategy_hint.setStyleSheet("color: #777;")
-        rnl.addWidget(self._rename_strategy_hint, 1)
+        rnl.addWidget(self._rename_strategy_hint)
 
         self._on_rename_strat_changed()
+        self._on_ai_mode_changed()
         l.addWidget(rn)
 
         l.addWidget(hdr)
@@ -1802,15 +1823,11 @@ class ReorganizePage(QWidget):
     def _on_ai_rename(self):
         """Open the AI Rename dialog for the current selection/view.
 
-        The dialog uses a preview-then-apply flow:
-          1. Pick AI backend / model / strategy.
-          2. Click "Run preview" — generates preview for the first N
-             files (default 5, configurable in the dialog).
-          3. Inspect the proposed names in the preview table.
-          4. Click "Apply" to rename on disk.
-
-        Preview generation runs in a background QThread so the UI
-        never freezes regardless of how slow CLIP / Ollama is.
+        The dialog mirrors the Organize page AI workflow:
+          1. Pick analysis mode (LowLevel / CLIP / Fusion / Ollama).
+          2. Toggle AI options and pick a model when relevant.
+          3. Click "Run preview" — generates preview for the first N files.
+          4. Inspect the proposed names and click "Apply".
         """
         paths = self._current_paths_for_rename()
         if not paths:
@@ -1822,25 +1839,20 @@ class ReorganizePage(QWidget):
             return
         from ..ai_rename_dialog import AIRenameDialog
         strategy = self._rename_strat.currentData() or "category_tags"
-        # Default to "auto" so the user gets the AI-first cascade
-        # (CLIP → Ollama → Analyzer). They can override inside the
-        # dialog. The AI backend selected in the Reorder header is
-        # passed in so the dialog stays consistent with the main
-        # rename controls.
-        header_backend = (self._ai_backend.currentData()
-                          if hasattr(self, "_ai_backend") else "auto") or "auto"
-        # User explicitly wants max 5 in the preview so they can see
-        # how names are applied without waiting for the full set.
         preview_cap = min(5, len(paths))
         dlg = AIRenameDialog(
             paths,
             category=self._cur_cat,
             parent=self,
-            default_backend=header_backend,
+            default_backend=self._selected_ai_mode(),
             default_strategy=strategy,
             max_tags=self._max_tags.value(),
             preview_limit=preview_cap,
             default_model=self._selected_ai_model(),
+            nsfw=self._cb_nsfw.isChecked(),
+            describe=self._cb_describe.isChecked(),
+            classify=self._cb_classify.isChecked(),
+            classify_method=(self._classify_method.currentData() or "tags"),
         )
         if dlg.exec() == QDialog.Accepted:
             self._status.setText("AI Rename complete")
@@ -1867,19 +1879,21 @@ class ReorganizePage(QWidget):
         from ..ai_rename_dialog import AIRenameDialog
         # Preview capped at 5 so the dialog opens instantly and the
         # user can grow the cap inside the dialog once they're sure
-        # the backend works.
+        # the mode works.
         preview_cap = min(5, len(paths))
-        header_backend = (self._ai_backend.currentData()
-                          if hasattr(self, "_ai_backend") else "auto") or "auto"
         dlg = AIRenameDialog(
             paths,
             category=self._cur_cat,
             parent=self,
-            default_backend=header_backend,
+            default_backend=self._selected_ai_mode(),
             default_strategy="category_tags",
             max_tags=self._max_tags.value(),
             preview_limit=preview_cap,
             default_model=self._selected_ai_model(),
+            nsfw=self._cb_nsfw.isChecked(),
+            describe=self._cb_describe.isChecked(),
+            classify=self._cb_classify.isChecked(),
+            classify_method=(self._classify_method.currentData() or "tags"),
         )
         if dlg.exec() == QDialog.Accepted:
             self._status.setText(
@@ -1899,6 +1913,21 @@ class ReorganizePage(QWidget):
             return ""
         return text
 
+    def _selected_ai_mode(self) -> str:
+        """Return the selected Organize analysis mode from the header."""
+        if not hasattr(self, "_ai_mode"):
+            return s.load_settings().get("organize_mode", "lowlevel")
+        return self._ai_mode.currentData() or "lowlevel"
+
+    def _ai_organize_options(self) -> Dict:
+        """Return Organize-style AI option overrides from the header."""
+        return {
+            "ollama_nsfw_enabled": self._cb_nsfw.isChecked(),
+            "ollama_describe_enabled": self._cb_describe.isChecked(),
+            "ollama_classify_enabled": self._cb_classify.isChecked(),
+            "ollama_classify_method": self._classify_method.currentData() or "tags",
+        }
+
     def _active_ai_model_for_strategy(self) -> str:
         """Return the active model from settings (CLIP or Ollama).
 
@@ -1908,8 +1937,8 @@ class ReorganizePage(QWidget):
         """
         try:
             cfg = s.load_settings()
-            mode = cfg.get("organize_mode", "lowlevel")
-            if mode == "clip":
+            mode = self._selected_ai_mode()
+            if mode == "clip" or mode == "fusion":
                 return cfg.get("clip_model", "ViT-B/32")
             if mode == "ollama":
                 return cfg.get("ollama_model", "llava:7b")
@@ -1938,22 +1967,84 @@ class ReorganizePage(QWidget):
             out.append(fp)
         return out
 
+    def _on_ai_mode_changed(self):
+        """Sync visibility of model picker / AI options / status to the selected mode."""
+        mode = self._ai_mode.currentData()
+        is_ai = mode in ("clip", "fusion", "ollama")
+        self._ai_opts_frame.setVisible(is_ai)
+        self._model_refresh_btn.setVisible(is_ai)
+
+        # Show model picker only for modes that need a model.
+        needs_model = mode in ("clip", "fusion", "ollama")
+        self._ai_model.setVisible(needs_model)
+        self._ai_model_label.setVisible(needs_model)
+        if needs_model and self._ai_model.count() <= 1:
+            self._populate_ai_model_combo()
+
+        descs = {
+            "lowlevel": "Classical CV: edge detection, texture, silhouette, HOG, Fourier",
+            "clip": "OpenAI CLIP zero-shot: semantic understanding",
+            "fusion": "CLIP semantic + LowLevel CV statistics - best of both",
+            "ollama": "Local vision LLM via Ollama",
+        }
+        self._ai_mode_desc.setText(descs.get(mode, ""))
+        self._refresh_ai_status()
+
+    def _populate_ai_model_combo(self):
+        """Fill the model picker with CLIP or Ollama models."""
+        mode = self._ai_mode.currentData()
+        prev = self._ai_model.currentText() if self._ai_model.count() else ""
+        self._ai_model.blockSignals(True)
+        try:
+            self._ai_model.clear()
+            self._ai_model.addItem("(configured)", None)
+            cfg = s.load_settings()
+            if mode in ("clip", "fusion"):
+                from ...gui.ai_rename_dialog import _list_clip_models
+                models = _list_clip_models()
+                default = cfg.get("clip_model", "ViT-B/32")
+                self._ai_model.addItems(models)
+            elif mode == "ollama":
+                from ...gui.ai_rename_dialog import _list_ollama_models
+                models = _list_ollama_models()
+                default = cfg.get("ollama_model", "llava:7b")
+                self._ai_model.addItems(models)
+            else:
+                default = ""
+            if prev and self._ai_model.findText(prev) >= 0:
+                self._ai_model.setCurrentIndex(self._ai_model.findText(prev))
+            elif default:
+                idx = self._ai_model.findText(default)
+                if idx >= 0:
+                    self._ai_model.setCurrentIndex(idx)
+        finally:
+            self._ai_model.blockSignals(False)
+
+    def _refresh_ai_model_list(self):
+        """Re-query available models for the current mode."""
+        self._populate_ai_model_combo()
+        self._refresh_ai_status()
+
     def _on_rename_strat_changed(self):
         """Show strategy hint and toggle controls."""
         strat = self._rename_strat.currentData() or ""
         is_tag = strat in TAG_BASED_STRATEGIES
         self._cb_rename_prefix.setEnabled(strat == "category" or is_tag)
-        # AI backend selector only matters for tag-based strategies.
+        # AI mode / options / status only matter for tag-based strategies.
         # When the strategy doesn't use tags, hide the controls so the
         # header stays clean.
-        self._ai_backend_label.setVisible(is_tag)
-        self._ai_backend.setVisible(is_tag)
+        self._ai_mode.setVisible(is_tag)
+        self._ai_mode_desc.setVisible(is_tag)
+        self._ai_opts_frame.setVisible(is_tag and self._ai_mode.currentData() in ("clip", "fusion", "ollama"))
+        needs_model = is_tag and self._ai_mode.currentData() in ("clip", "fusion", "ollama")
+        self._ai_model.setVisible(needs_model)
+        self._ai_model_label.setVisible(needs_model)
+        self._model_refresh_btn.setVisible(needs_model)
         self._ai_status.setVisible(is_tag)
         if is_tag:
-            backend = self._ai_backend.currentData() or "auto"
-            backend_label = self._ai_backend.currentText()
+            mode = self._ai_mode.currentData() or "lowlevel"
             self._rename_strategy_hint.setText(
-                f"Tag-based: {backend_label}. The backend detects content "
+                f"Tag-based: mode={mode}. The analyzer detects content "
                 "(anime / cyberpunk / portrait / ...) for each image and "
                 "embeds the top tags in the filename. First-time use "
                 "may take a few seconds per image."
@@ -1973,24 +2064,31 @@ class ReorganizePage(QWidget):
         self._refresh_rename_buttons()
 
     def _refresh_ai_status(self):
-        """Probe CLIP / Ollama availability for the AI backend status label.
-
-        Cheap probes (no model load) — runs once when the dialog opens
-        and again whenever the user changes the backend dropdown.
-        """
-        # Only relevant when the selector is visible (tag-based strategy).
-        if not self._ai_backend.isVisible():
+        """Probe CLIP / Ollama availability for the selected analysis mode."""
+        if not self._ai_status.isVisible():
             return
-        # CLIP probe.
-        clip_ok = False
-        try:
-            from ...clip_client import get_engine
-            engine = get_engine()
-            clip_ok = bool(engine.available)
-        except Exception:
-            clip_ok = False
-        # Ollama probe (network call with short timeout).
-        ollama_ok = False
+        mode = self._ai_mode.currentData() or "lowlevel"
+        if mode == "lowlevel":
+            self._ai_status.setText("Low-Level CV (no AI model)")
+            self._ai_status.setStyleSheet("color: #888;")
+            return
+
+        if mode in ("clip", "fusion"):
+            try:
+                from ...clip_client import get_engine
+                engine = get_engine()
+                clip_ok = bool(engine.available)
+            except Exception:
+                clip_ok = False
+            if clip_ok:
+                self._ai_status.setText("✓ CLIP loaded" if mode == "clip" else "✓ CLIP loaded — Fusion ready")
+                self._ai_status.setStyleSheet("color: #6fbf73;")
+            else:
+                self._ai_status.setText("✗ CLIP not loaded")
+                self._ai_status.setStyleSheet("color: #c95;")
+            return
+
+        # mode == "ollama"
         try:
             from ...ollama_client import OllamaClient
             cfg = s.load_settings()
@@ -2004,40 +2102,12 @@ class ReorganizePage(QWidget):
                 client.close()
         except Exception:
             ollama_ok = False
-
-        backend = self._ai_backend.currentData()
-        if backend == "clip":
-            if clip_ok:
-                self._ai_status.setText("✓ CLIP loaded")
-                self._ai_status.setStyleSheet("color: #6fbf73;")
-            else:
-                self._ai_status.setText("✗ CLIP not loaded")
-                self._ai_status.setStyleSheet("color: #c95;")
-        elif backend == "ollama":
-            if ollama_ok:
-                self._ai_status.setText("✓ Ollama reachable")
-                self._ai_status.setStyleSheet("color: #6fbf73;")
-            else:
-                self._ai_status.setText("✗ Ollama unreachable")
-                self._ai_status.setStyleSheet("color: #c95;")
-        elif backend == "heuristic":
-            self._ai_status.setText("(no AI, CV only)")
-            self._ai_status.setStyleSheet("color: #888;")
-        else:  # auto
-            bits = []
-            if clip_ok:
-                bits.append("CLIP ✓")
-            if ollama_ok:
-                bits.append("Ollama ✓")
-            if not bits:
-                self._ai_status.setText(
-                    "no AI backend — will use analyzer"
-                )
-                self._ai_status.setStyleSheet("color: #c95;")
-            else:
-                cascade = " → ".join(bits + ["Analyzer"])
-                self._ai_status.setText(f"cascade: {cascade}")
-                self._ai_status.setStyleSheet("color: #888;")
+        if ollama_ok:
+            self._ai_status.setText("✓ Ollama reachable")
+            self._ai_status.setStyleSheet("color: #6fbf73;")
+        else:
+            self._ai_status.setText("✗ Ollama unreachable")
+            self._ai_status.setStyleSheet("color: #c95;")
 
     def _refresh_rename_buttons(self):
         """Enable rename buttons only when there are visible files."""
@@ -2067,26 +2137,27 @@ class ReorganizePage(QWidget):
 
         `mode` is 'rename_only' (in-place) or 'move' (move+rename).
 
-        For tag-based strategies the worker uses the AI backend selected
-        in the header (default "auto" = CLIP → Ollama → Analyzer) so
-        the rename produces content-aware filenames.
+        For tag-based strategies the worker uses the Organize-page
+        pipeline (analysis mode + AI options selected in the header)
+        so the rename produces content-aware filenames.
         """
         if hasattr(self, "_rename_job") and self._rename_job and self._rename_job.isRunning():
             QMessageBox.information(self, "Busy", "A rename job is already running.")
             return
 
-        ai_backend = (self._ai_backend.currentData()
-                      if hasattr(self, "_ai_backend") else "auto") or "auto"
-        ai_model = self._active_ai_model_for_strategy()
+        ai_mode = self._selected_ai_mode()
+        ai_model = self._selected_ai_model()
+        organize_options = self._ai_organize_options()
         self._rename_job = _RenameJob(
             paths=paths,
             target_dir=target_dir,
             strategy=strategy,
             category=category,
             max_tags=max_tags,
-            ai_backend=ai_backend,
-            ai_mode="auto",  # always use the configured organise mode for the analyzer fallback
+            ai_backend="organize",
+            ai_mode=ai_mode,
             ai_model=ai_model,
+            organize_options=organize_options,
         )
         self._rename_job.progress.connect(self._on_rename_progress)
         self._rename_job.finished_ok.connect(self._on_rename_done)

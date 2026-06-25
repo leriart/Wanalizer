@@ -459,13 +459,12 @@ def test_ai_rename_dialog_no_auto_preview():
     assert dlg._run_btn.isEnabled() is True
 
 
-def test_ai_rename_dialog_default_backend_is_auto():
-    """Default backend must be 'auto' (AI-first cascade: CLIP → Ollama → Analyzer).
+def test_ai_rename_dialog_default_mode_is_organized():
+    """Default analysis mode mirrors the Organize page.
 
-    The user explicitly asked for AI-driven tag detection using the
-    full tag registry. The "auto" cascade tries CLIP first (semantic
-    match against the full registry), falls back to Ollama, then to
-    the analyzer heuristics.
+    The dialog now uses the same mode selector as Organize
+    (LowLevel / CLIP / Fusion / Ollama). The legacy `default_backend`
+    parameter is mapped to the corresponding Organize mode.
     """
     import sys
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -474,14 +473,16 @@ def test_ai_rename_dialog_default_backend_is_auto():
     from wallpaper_analyzer.gui.ai_rename_dialog import AIRenameDialog
     dlg = AIRenameDialog(
         files=["/tmp/fake.jpg"], category="Anime",
-        default_backend="ollama",  # caller override is honoured
+        default_backend="ollama",  # legacy backend maps to Organize mode
     )
-    assert dlg._backend.currentData() == "ollama"
+    assert dlg._mode_combo.currentData() == "ollama"
 
-    # Without a caller override we default to 'auto' so the AI cascade
-    # runs by default (CLIP / Ollama / Analyzer in that order).
+    # Without a caller override we default to the configured organize mode.
+    from wallpaper_analyzer.settings import load_settings
     dlg2 = AIRenameDialog(files=["/tmp/fake.jpg"], category="Anime")
-    assert dlg2._backend.currentData() == "auto"
+    cfg = load_settings()
+    expected = cfg.get("organize_mode", "lowlevel")
+    assert dlg2._mode_combo.currentData() == expected
 
 
 def test_clip_tag_vocab_is_full():

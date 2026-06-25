@@ -164,9 +164,9 @@ def test_reorder_page_can_be_constructed_with_rename_header():
     from wallpaper_analyzer.gui.pages import reorganize
     src = inspect.getsource(reorganize)
     # Required header attributes the user interacts with.
-    for attr in ("_ai_backend", "_ai_model", "_ai_model_label",
+    for attr in ("_ai_mode", "_ai_model", "_ai_model_label",
                  "_ai_status", "btn_ai_rename", "btn_ai_rename_cat"):
         assert f"self.{attr}" in src, f"missing {attr} in Reorder page"
     # Removed attributes must NOT be present.
-    for removed in ("self.btn_rename_only", "self.btn_rename ="):
+    for removed in ("self.btn_rename_only", "self.btn_rename =", "self._ai_backend"):
         assert removed not in src, f"{removed} should have been removed"
