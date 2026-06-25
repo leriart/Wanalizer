@@ -5,6 +5,10 @@
 </h1>
 
 <p>
+  <img src="assets/collage.png" alt="Wanalizer collage preview" width="720">
+</p>
+
+<p>
   <strong>Intelligent wallpaper organization that runs entirely on your machine.</strong>
 </p>
 
