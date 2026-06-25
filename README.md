@@ -1,19 +1,56 @@
-# Wanalizer
+<div align="center">
 
-Intelligent wallpaper organization that runs entirely on your machine.
+<h1>
+  <img src="https://img.shields.io/badge/WANALIZER-ff007c?style=for-the-badge&logo=python&logoColor=white" alt="Wanalizer">
+</h1>
 
-Wanalizer sorts a folder of unsorted wallpapers into named category
-folders using one of four interchangeable analysis pipelines:
+<p>
+  <strong>Intelligent wallpaper organization that runs entirely on your machine.</strong>
+</p>
 
-- **Low-Level CV** - classical computer vision, no ML, any CPU.
-- **CLIP** - OpenAI zero-shot vision-language model.
-- **Fusion** - CLIP + Low-Level CV combined through a 13-signal scorer
-  (recommended when CLIP is available).
-- **Ollama** - local vision LLMs (LLaVA, MiniCPM-V, Moondream, ...).
+<p>
+  <img src="https://img.shields.io/badge/version-3.0.0-7aa2f7?style=for-the-badge&logo=none" alt="Version">
+  <img src="https://img.shields.io/badge/python-3.10%2B-9ece6a?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/license-MIT-e0af68?style=for-the-badge&logo=none" alt="License">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-7dcfff?style=for-the-badge&logo=none" alt="Platform">
+</p>
 
-It ships as both a **PySide6 desktop application** and a complete
-**command-line interface**, backed by the same pipeline. No feature is
-hidden behind the GUI.
+<p>
+  <img src="https://img.shields.io/badge/modes-4%20pipelines-f7768e?style=for-the-badge&logo=none" alt="Modes">
+  <img src="https://img.shields.io/badge/signals-13%20weighted-bb9af7?style=for-the-badge&logo=none" alt="Signals">
+  <img src="https://img.shields.io/badge/formats-50%2B%20image%20types-ff9e64?style=for-the-badge&logo=none" alt="Formats">
+</p>
+
+</div>
+
+---
+
+<div align="center">
+
+## Four ways to understand an image
+
+</div>
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="https://img.shields.io/badge/Low--Level_CV-c0caf5?style=flat-square&logo=none" alt="Low-Level CV"><br>
+      <sub>Classical CV, no ML, any CPU</sub>
+    </td>
+    <td align="center">
+      <img src="https://img.shields.io/badge/CLIP-7aa2f7?style=flat-square&logo=none" alt="CLIP"><br>
+      <sub>OpenAI zero-shot vision-language</sub>
+    </td>
+    <td align="center">
+      <img src="https://img.shields.io/badge/Fusion-ff007c?style=flat-square&logo=none" alt="Fusion"><br>
+      <sub>CLIP + CV combined, recommended</sub>
+    </td>
+    <td align="center">
+      <img src="https://img.shields.io/badge/Ollama-9ece6a?style=flat-square&logo=none" alt="Ollama"><br>
+      <sub>Local vision LLMs</sub>
+    </td>
+  </tr>
+</table>
 
 ---
 
@@ -37,33 +74,30 @@ hidden behind the GUI.
 
 ---
 
+<div align="center">
+
 ## Highlights
 
-- **Four interchangeable analysis modes** sharing a single pipeline
-  abstraction.
-- **13-signal multi-scorer** with anti-pollution defences so noisy tag
-  registries cannot hijack the result.
-- **MD5 duplicate detection** with a per-folder cache. The second
-  scan is essentially free; per-group keep/move/delete decisions.
-- **Per-category configuration** via an interactive Q&A wizard or
-  AI-suggested rules sampled from your own images.
-- **Reorganize tab**: visual browser with thumbnails, aspect-ratio
-  filter, rename dialog, and per-folder "expected" specifications.
-- **50+ image formats** supported (JPEG, PNG, WebP, AVIF, HEIC, PSD,
-  TIFF, RAW, SVG, PDF, ...) plus single-frame extraction for videos
-  and animated images via `ffmpeg`.
-- **True parallel hashing and classification** via
-  `ProcessPoolExecutor` and an optional **free-threaded Python 3.14t**
-  runtime for genuine no-GIL threading.
-- **GUI and CLI from one package**. After `pip install .` two console
-  scripts are available: `wanalyzer` and `wanalyzer-gui`.
+</div>
+
+- **Four interchangeable analysis modes** sharing a single pipeline abstraction.
+- **13-signal multi-scorer** with anti-pollution defences so noisy tag registries cannot hijack the result.
+- **MD5 duplicate detection** with a per-folder cache. The second scan is essentially free; per-group keep/move/delete decisions.
+- **Per-category configuration** via an interactive Q&A wizard or AI-suggested rules sampled from your own images.
+- **Reorganize tab**: visual browser with thumbnails, aspect-ratio filter, rename dialog, and per-folder "expected" specifications.
+- **50+ image formats** supported (JPEG, PNG, WebP, AVIF, HEIC, PSD, TIFF, RAW, SVG, PDF, ...) plus single-frame extraction for videos and animated images via `ffmpeg`.
+- **True parallel hashing and classification** via `ProcessPoolExecutor` and an optional **free-threaded Python 3.14t** runtime for genuine no-GIL threading.
+- **GUI and CLI from one package**. After `pip install .` two console scripts are available: `wanalyzer` and `wanalyzer-gui`.
 
 ---
 
+<div align="center">
+
 ## Why Wanalizer
 
-Other wallpaper organizers usually have one or more of these
-limitations:
+</div>
+
+Other wallpaper organizers usually have one or more of these limitations:
 
 - Require a remote API (privacy + latency).
 - Require a GPU.
@@ -78,14 +112,18 @@ Wanalizer takes a different approach:
 | Semantic understanding     | CLIP, Fusion, and Ollama modes.                              |
 | Detects duplicates         | MD5 with incremental cache.                                  |
 | Per-category tuning        | Q&A wizard, AI Suggest, or hand-edited JSON.                 |
-| Visual browser             | Reorganize page with thumbnails and filters.                |
-| Multi-signal classifier    | 13 weighted signals, pollution-aware.                       |
+| Visual browser             | Reorganize page with thumbnails and filters.                 |
+| Multi-signal classifier    | 13 weighted signals, pollution-aware.                        |
 | True parallel CPU work     | ProcessPoolExecutor + optional free-threaded Python 3.14t.   |
 | GUI and CLI from one code  | Shared pipeline, identical behaviour.                        |
 
 ---
 
+<div align="center">
+
 ## Quick start
+
+</div>
 
 ```bash
 git clone https://github.com/leo/Wanalizer.git
@@ -115,7 +153,11 @@ The first run downloads Python 3.14t (~30 MB) automatically.
 
 ---
 
+<div align="center">
+
 ## Analysis modes
+
+</div>
 
 | Mode                | What it uses                                                    | Strength                                                        | Dependencies                          | Speed                         |
 |---------------------|-----------------------------------------------------------------|-----------------------------------------------------------------|---------------------------------------|-------------------------------|
@@ -124,36 +166,33 @@ The first run downloads Python 3.14t (~30 MB) automatically.
 | **Fusion**          | Low-Level CV + CLIP in parallel, 13-signal fusion                | Best of both worlds; recommended when CLIP is available         | torch, clip, Pillow, numpy            | Slower than CLIP alone        |
 | **Ollama**          | Local vision LLM via Ollama (LLaVA, MiniCPM-V, Llama 3.2 Vision, Moondream) | Natural-language descriptions, character recognition, NSFW      | requests + running Ollama server      | Medium                        |
 
-Fusion is a strict superset of Low-Level: it gracefully degrades to
-Low-Level when CLIP cannot be loaded.
+Fusion is a strict superset of Low-Level: it gracefully degrades to Low-Level when CLIP cannot be loaded.
 
 ---
+
+<div align="center">
 
 ## How classification works
 
-1. **Source files** are scanned from the current directory (or any
-   folder you pass via `--dest` / `--set-dest`).
-2. If **dedupe is enabled**, MD5s are computed and exact duplicates
-   are moved to a `Duplicates/` folder (cached for next time).
-3. Each remaining file is analysed by the selected mode and turned
-   into a **profile dict** with weights, style scores, theme scores,
-   content detectors, and (where available) CLIP scores.
-4. The **multi-signal combiner** scores every category against the
-   profile and picks the best match, optionally weighted by the
-   category's `expected` specification.
-5. The file is **moved into the winning category**, optionally
-   renamed according to the strategy in the Organize tab.
+</div>
 
-The full pipeline lives in `wallpaper_analyzer/organize.py` and is the
-same code path used by both the CLI and the GUI.
+1. **Source files** are scanned from the current directory (or any folder you pass via `--dest` / `--set-dest`).
+2. If **dedupe is enabled**, MD5s are computed and exact duplicates are moved to a `Duplicates/` folder (cached for next time).
+3. Each remaining file is analysed by the selected mode and turned into a **profile dict** with weights, style scores, theme scores, content detectors, and (where available) CLIP scores.
+4. The **multi-signal combiner** scores every category against the profile and picks the best match, optionally weighted by the category's `expected` specification.
+5. The file is **moved into the winning category**, optionally renamed according to the strategy in the Organize tab.
+
+The full pipeline lives in `wallpaper_analyzer/organize.py` and is the same code path used by both the CLI and the GUI.
 
 ---
 
+<div align="center">
+
 ## Multi-signal combiner
 
-Every analyzer returns a profile dict. `wallpaper_analyzer/classify.py`
-combines **13 weighted signals** into a single confidence score per
-category:
+</div>
+
+Every analyzer returns a profile dict. `wallpaper_analyzer/classify.py` combines **13 weighted signals** into a single confidence score per category:
 
 | Signal      | Weight | What it measures                                                                |
 |-------------|--------|---------------------------------------------------------------------------------|
@@ -171,18 +210,17 @@ category:
 | clip_nsfw   | 0.05   | CLIP-driven NSFW boost for `nsfw` / `18+` / `ecchi` categories                  |
 | fingerprint | 0.20   | Z-score similarity against each category's learned CV fingerprint               |
 
-The **fingerprint** signal is the most reliable because it compares
-the image's CV profile against the actual feature distribution of
-each category. The **clip** signal is the most discriminative when
-CLIP has run. Tag-based signals have explicit **anti-pollution
-defences** so a noisy registry cannot hijack the result.
+The **fingerprint** signal is the most reliable because it compares the image's CV profile against the actual feature distribution of each category. The **clip** signal is the most discriminative when CLIP has run. Tag-based signals have explicit **anti-pollution defences** so a noisy registry cannot hijack the result.
 
 ---
 
+<div align="center">
+
 ## Per-category configuration
 
-Each category folder contains a `.category.json` describing what
-belongs there. Example for a Cyberpunk folder:
+</div>
+
+Each category folder contains a `.category.json` describing what belongs there. Example for a Cyberpunk folder:
 
 ```json
 {
@@ -209,22 +247,20 @@ belongs there. Example for a Cyberpunk folder:
 Three ways to create one:
 
 1. **Interactive Q&A wizard** - Categories page, Configure (Q&A).
-2. **AI Suggest** - Categories page, AI Suggest. Samples images, runs
-   CLIP + CV, proposes an `expected` block you can review and save.
+2. **AI Suggest** - Categories page, AI Suggest. Samples images, runs CLIP + CV, proposes an `expected` block you can review and save.
 3. **Manual JSON edit**.
 
-After configuration, the Reorganize tab shows the expected spec in
-the sidebar tooltip, and `classify.config_match_score` uses the spec
-as a soft tie-breaker when classifying.
+After configuration, the Reorganize tab shows the expected spec in the sidebar tooltip, and `classify.config_match_score` uses the spec as a soft tie-breaker when classifying.
 
 ---
 
+<div align="center">
+
 ## Duplicate detection
 
-The Duplicates tab detects exact duplicates via **MD5 hashing**. The
-hash cache lives in `.wallpaper_analyzer_hashes.json` inside the
-destination folder, so the second and subsequent scans only hash new
-files.
+</div>
+
+The Duplicates tab detects exact duplicates via **MD5 hashing**. The hash cache lives in `.wallpaper_analyzer_hashes.json` inside the destination folder, so the second and subsequent scans only hash new files.
 
 For each duplicate group:
 
@@ -238,13 +274,15 @@ CLI shortcut:
 ./run.sh --cli --find-duplicates
 ```
 
-For visually-similar but byte-different images, the underlying
-perceptual-hash primitives are still available in
-`wallpaper_analyzer.hashing` for advanced callers.
+For visually-similar but byte-different images, the underlying perceptual-hash primitives are still available in `wallpaper_analyzer.hashing` for advanced callers.
 
 ---
 
+<div align="center">
+
 ## GUI overview
+
+</div>
 
 The GUI ships with **9 pages** wired into a single `QStackedWidget`:
 
@@ -283,7 +321,11 @@ A typical session:
 
 ---
 
+<div align="center">
+
 ## Project structure
+
+</div>
 
 ```
 Wanalizer/
@@ -364,13 +406,15 @@ Wanalizer/
 
 ---
 
+<div align="center">
+
 ## Installation
+
+</div>
 
 ### Option A - launcher (recommended)
 
-The launcher auto-creates `.venv`, installs PySide6, picks the right
-Python interpreter, and falls back to a free-threaded runtime when
-asked:
+The launcher auto-creates `.venv`, installs PySide6, picks the right Python interpreter, and falls back to a free-threaded runtime when asked:
 
 ```bash
 ./run.sh                  # GUI
@@ -424,9 +468,7 @@ brew install ffmpeg
 
 ### Environment variables
 
-Settings can be overridden via environment variables. They take
-precedence over `.wallpaper_analyzer.json` but are overridden by
-explicit CLI flags.
+Settings can be overridden via environment variables. They take precedence over `.wallpaper_analyzer.json` but are overridden by explicit CLI flags.
 
 | Variable                  | Equivalent setting key                  |
 |---------------------------|------------------------------------------|
@@ -443,7 +485,11 @@ explicit CLI flags.
 
 ---
 
+<div align="center">
+
 ## CLI reference
+
+</div>
 
 ```
 wanalyzer [-h] [--mode {lowlevel,clip,fusion,ollama}] [--dest DIR]
@@ -483,7 +529,11 @@ wanalyzer [-h] [--mode {lowlevel,clip,fusion,ollama}] [--dest DIR]
 
 ---
 
+<div align="center">
+
 ## Tips and recipes
+
+</div>
 
 Preview without moving anything:
 
@@ -503,8 +553,7 @@ Use all your cores for hashing and classification:
 ./run.sh --cli --mode lowlevel --parallel 16
 ```
 
-Fusion / CLIP / Ollama modes automatically cap workers at 1 to avoid
-loading the model four times into RAM.
+Fusion / CLIP / Ollama modes automatically cap workers at 1 to avoid loading the model four times into RAM.
 
 Point Wanalizer at a different library:
 
@@ -541,7 +590,11 @@ ruff check .
 
 ---
 
+<div align="center">
+
 ## Roadmap
+
+</div>
 
 - [x] MD5-only duplicate detection with cache (v3.0)
 - [x] CLIP + LowLevel fusion mode (v3.0)
@@ -557,6 +610,16 @@ ruff check .
 
 ---
 
+<div align="center">
+
 ## License
 
-[MIT](LICENSE) - see `LICENSE` for the full text.
+</div>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-9ece6a?style=for-the-badge&logo=none" alt="MIT License"></a>
+</p>
+
+<p align="center">
+  Made for organized desktops everywhere.
+</p>
