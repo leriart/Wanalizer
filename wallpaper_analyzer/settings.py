@@ -11,6 +11,8 @@ SETTINGS_DEFAULTS = {
     "source_dir": "",
     "dest_dir": "WP",
     "dedupe": True,
+    "dedupe_perceptual": True,
+    "dedupe_min_tier": "reencode",
     "video_ffmpeg": True,
     "quality_gate": True,
     "quality_min": 0.0,

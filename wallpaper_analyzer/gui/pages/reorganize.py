@@ -22,6 +22,7 @@ Features
 * Undo the last move(s) - one click reverses the most recent move
 """
 import os, shutil, subprocess, tempfile, queue
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
 from PySide6.QtWidgets import (
@@ -330,9 +331,14 @@ class ThumbWorker(QThread):
 class _RenameJob(QThread):
     """Background worker: compute rename pairs and apply them.
 
-    For tag-based strategies, tags are detected per file (cached). For move
-    jobs, files are first copied to the target directory then renamed to
-    keep the destination's existing index pattern intact.
+    For tag-based strategies, tags are detected via the AI combined
+    classifier (CLIP → analyzer → suggest_tags) by default — the same
+    pipeline used by the AI Rename dialog. This guarantees that the
+    "Rename on move" and "Rename only" buttons in the Reorder page
+    produce content-aware filenames, not colour-only ones.
+
+    Non-tag strategies (sequential, category, hash, ...) skip AI work
+    entirely.
 
     Signals:
         progress(int, int)  - (done, total)
@@ -343,84 +349,148 @@ class _RenameJob(QThread):
     finished_ok = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, paths, target_dir, strategy, category, max_tags):
+    def __init__(self, paths, target_dir, strategy, category, max_tags,
+                 ai_backend="auto", ai_mode="auto", ai_model=None):
         super().__init__()
         self.paths = list(paths)
         self.target_dir = target_dir  # None for in-place rename
         self.strategy = strategy
         self.category = category or ""
         self.max_tags = max_tags
+        self.ai_backend = ai_backend or "auto"
+        self.ai_mode = ai_mode or "auto"
+        self.ai_model = ai_model or None
 
     def run(self):
         try:
-            from ... import rename as _rename
-            # Build pairs in chunks so we can emit progress for big batches.
-            tags_by_file = {}
-            subject_by_file = {}
-            if self.strategy in _rename.TAG_BASED_STRATEGIES:
-                total = len(self.paths)
-                for i, p in enumerate(self.paths, 1):
-                    tags, subject = _rename.get_tags_for_file(
-                        p, category=self.category, max_tags=self.max_tags,
-                    )
-                    tags_by_file[p] = tags
-                    subject_by_file[p] = subject
-                    if i % 5 == 0 or i == total:
-                        self.progress.emit(i, total)
-
-            pairs = _rename.build_renames(
-                self.paths,
+            result = _execute_rename_job(
+                paths=self.paths,
+                target_dir=self.target_dir,
                 strategy=self.strategy,
                 category=self.category,
                 max_tags=self.max_tags,
-                tags_by_file=tags_by_file,
-                subject_by_file=subject_by_file,
+                ai_backend=self.ai_backend,
+                ai_mode=self.ai_mode,
+                ai_model=self.ai_model,
+                on_progress=lambda cur, total: self.progress.emit(cur, total),
             )
-
-            moved = 0
-            renamed = 0
-            errors: List[str] = []
-            # If target_dir is given, the new filename is computed against the
-            # SOURCE directory by build_renames; relocate it to target_dir.
-            final_pairs = []
-            for old, new in pairs:
-                if self.target_dir:
-                    new = os.path.join(self.target_dir, os.path.basename(new))
-                final_pairs.append((old, new))
-
-            for i, (old, new) in enumerate(final_pairs, 1):
-                try:
-                    if old == new:
-                        continue
-                    os.makedirs(os.path.dirname(new), exist_ok=True)
-                    if os.path.exists(new):
-                        base, ext = os.path.splitext(new)
-                        counter = 1
-                        candidate = f"{base}_{counter}{ext}"
-                        while os.path.exists(candidate):
-                            counter += 1
-                            candidate = f"{base}_{counter}{ext}"
-                        new = candidate
-                    if os.path.dirname(old) != os.path.dirname(new):
-                        shutil.move(old, new)
-                        moved += 1
-                    else:
-                        os.rename(old, new)
-                    renamed += 1
-                    if i % 10 == 0 or i == len(final_pairs):
-                        self.progress.emit(i, len(final_pairs))
-                except Exception as e:
-                    errors.append(f"{os.path.basename(old)}: {e}")
-            self.finished_ok.emit({
-                "pairs": final_pairs,
-                "renamed": renamed,
-                "moved": moved,
-                "errors": len(errors),
-                "error_list": errors[:10],
-                "strategy": self.strategy,
-            })
+            self.finished_ok.emit(result)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+def _execute_rename_job(paths, target_dir, strategy, category, max_tags,
+                        ai_backend="auto", ai_mode="auto", ai_model=None,
+                        on_progress=None) -> Dict:
+    """Core rename-job logic, split out so it can be tested without QThread.
+
+    Returns a dict with:
+      pairs: list of (old_path, new_path) — new_path is final (after
+             relocation to target_dir and collision-suffix).
+      renamed: count of files actually renamed.
+      moved: count of files moved across directories.
+      errors: count of failures.
+      error_list: short list of error strings.
+      strategy: the strategy used.
+      ai_backend: which AI backend ran (None for non-tag strategies).
+      ai_log: short per-file AI summary (up to 10 lines).
+    """
+    from ... import rename as _rename
+    tags_by_file: Dict[str, List[str]] = {}
+    subject_by_file: Dict[str, Optional[str]] = {}
+    ai_log: List[str] = []
+
+    if strategy in _rename.TAG_BASED_STRATEGIES:
+        ren = _rename.AIRenamer(
+            backend=ai_backend,
+            mode=ai_mode,
+            model=ai_model,
+            max_tags=max_tags,
+            force_reprocess=False,
+        )
+        try:
+            total = len(paths)
+            for i, p in enumerate(paths, 1):
+                try:
+                    tags, subject = ren.detect_tags(p, category=category)
+                    tags = _rename._fallback_tags(
+                        p, tags, max_tags=max_tags,
+                    )
+                    tags_by_file[p] = tags
+                    subject_by_file[p] = subject
+                    ai_log.append(
+                        f"{os.path.basename(p)}: {tags[:3]}"
+                    )
+                except Exception as e:
+                    ai_log.append(
+                        f"{os.path.basename(p)}: ERR {type(e).__name__}"
+                    )
+                    tags_by_file[p] = []
+                    subject_by_file[p] = None
+                if on_progress is not None and (i % 5 == 0 or i == total):
+                    try:
+                        on_progress(i, total)
+                    except Exception:
+                        pass
+        finally:
+            ren.close()
+
+    pairs = _rename.build_renames(
+        paths,
+        strategy=strategy,
+        category=category,
+        max_tags=max_tags,
+        tags_by_file=tags_by_file,
+        subject_by_file=subject_by_file,
+    )
+
+    moved = 0
+    renamed = 0
+    errors: List[str] = []
+    final_pairs: List[Tuple[str, str]] = []
+    for old, new in pairs:
+        if target_dir:
+            new = os.path.join(target_dir, os.path.basename(new))
+        final_pairs.append((old, new))
+
+    total_pairs = len(final_pairs)
+    for i, (old, new) in enumerate(final_pairs, 1):
+        try:
+            if old == new:
+                continue
+            os.makedirs(os.path.dirname(new), exist_ok=True)
+            if os.path.exists(new):
+                base, ext = os.path.splitext(new)
+                counter = 1
+                candidate = f"{base}_{counter}{ext}"
+                while os.path.exists(candidate):
+                    counter += 1
+                    candidate = f"{base}_{counter}{ext}"
+                new = candidate
+            if os.path.dirname(old) != os.path.dirname(new):
+                shutil.move(old, new)
+                moved += 1
+            else:
+                os.rename(old, new)
+            renamed += 1
+            if on_progress is not None and (i % 10 == 0 or i == total_pairs):
+                try:
+                    on_progress(i, total_pairs)
+                except Exception:
+                    pass
+        except Exception as e:
+            errors.append(f"{os.path.basename(old)}: {e}")
+
+    return {
+        "pairs": final_pairs,
+        "renamed": renamed,
+        "moved": moved,
+        "errors": len(errors),
+        "error_list": errors[:10],
+        "strategy": strategy,
+        "ai_backend": ai_backend if strategy in _rename.TAG_BASED_STRATEGIES else None,
+        "ai_log": ai_log[:10],
+    }
 
 
 class DragGridList(QListWidget):
@@ -621,39 +691,26 @@ class ReorganizePage(QWidget):
         )
         hl.addWidget(self.cb_rename)
 
-        self.btn_rename = QPushButton("Rename dialog...")
-        self.btn_rename.setObjectName("primary")
-        self.btn_rename.setToolTip(
-            "Open the full Rename dialog (preview, dry-run, batch options)."
-        )
-        self.btn_rename.clicked.connect(self._on_rename)
-        self.btn_rename.setEnabled(False)
-        hl.addWidget(self.btn_rename)
-
-        self.btn_rename_only = QPushButton("Rename only")
-        self.btn_rename_only.setObjectName("success")
-        self.btn_rename_only.setToolTip(
-            "Rename currently visible/selected files in place — "
-            "without moving them — using the Strategy below."
-        )
-        self.btn_rename_only.clicked.connect(self._on_rename_only)
-        self.btn_rename_only.setEnabled(False)
-        hl.addWidget(self.btn_rename_only)
-
+        # Single AI rename button — opens the AI Rename dialog which
+        # handles preview + apply with explicit user-controlled flow.
+        # The old "Rename dialog..." / "Rename only" / "AI Rename
+        # category..." buttons were removed: the non-AI dialog is
+        # superseded by the AI pipeline, "Rename only" froze the UI
+        # by running AI synchronously, and "AI Rename category..." was
+        # redundant with this single entry-point.
         self.btn_ai_rename = QPushButton("AI Rename...")
-        self.btn_ai_rename.setObjectName("success")
+        self.btn_ai_rename.setObjectName("primary")
         self.btn_ai_rename.setToolTip(
-            "AI-powered rename: pick a backend (Ollama / CLIP / "
-            "Heuristic / Auto) and rename the currently visible "
-            "files using AI-detected content tags. Supports preview "
-            "and dry-run."
+            "AI-powered rename with preview (5 files shown by default). "
+            "Pick a backend / model, generate preview, then apply. "
+            "Preview-then-apply flow keeps the UI responsive."
         )
         self.btn_ai_rename.clicked.connect(self._on_ai_rename)
         self.btn_ai_rename.setEnabled(False)
         hl.addWidget(self.btn_ai_rename)
 
         self.btn_ai_rename_cat = QPushButton("AI Rename category...")
-        self.btn_ai_rename_cat.setObjectName("primary")
+        self.btn_ai_rename_cat.setObjectName("success")
         self.btn_ai_rename_cat.setToolTip(
             "Pick a category in the sidebar, then click this to rename "
             "EVERY file in that category at once using AI-detected tags. "
@@ -725,6 +782,80 @@ class ReorganizePage(QWidget):
         )
         self._max_tags.valueChanged.connect(lambda _v: self._refresh_rename_buttons())
         rnl.addWidget(self._max_tags)
+
+        # AI backend selector — visible only for tag-based strategies.
+        # Uses the same combined classifier (CLIP → analyzer → suggest_tags)
+        # as the AI Rename dialog so the "Rename on move" / "Rename only"
+        # buttons produce content-aware filenames.
+        self._ai_backend_label = QLabel("AI backend:")
+        rnl.addWidget(self._ai_backend_label)
+        self._ai_backend = QComboBox()
+        from ... import rename as _rename_compat
+        _AI_BACKEND_OPTIONS = (
+            ("auto",      "Auto (CLIP → Ollama → Analyzer)"),
+            ("clip",      "CLIP (semantic match against tag registry)"),
+            ("ollama",    "Ollama (local vision LLM)"),
+            ("heuristic", "Analyzer (same as category assignment, no AI)"),
+        )
+        for key, label in _AI_BACKEND_OPTIONS:
+            self._ai_backend.addItem(label, key)
+        self._ai_backend.setCurrentIndex(0)  # auto
+        self._ai_backend.setToolTip(
+            "AI backend used to detect content tags for tag-based rename "
+            "strategies. Auto (default) tries CLIP first (matches against "
+            "the full tag registry), falls back to Ollama, then the analyzer."
+        )
+        self._ai_backend.currentIndexChanged.connect(
+            lambda _i: self._refresh_ai_status()
+        )
+        rnl.addWidget(self._ai_backend)
+
+        # AI model picker — visible only for CLIP / Ollama backends.
+        # Lets the user pin a specific model BEFORE opening the AI
+        # Rename dialog so the dialog opens with the right selection
+        # and doesn't have to be reconfigured after.
+        self._ai_model_label = QLabel("Model:")
+        rnl.addWidget(self._ai_model_label)
+        self._ai_model = QComboBox()
+        self._ai_model.setEditable(True)
+        self._ai_model.setMinimumWidth(140)
+        self._ai_model.setToolTip(
+            "Specific AI model to use. Leave on '(configured)' to "
+            "inherit from the AI Models page settings. Only relevant "
+            "for CLIP / Ollama backends."
+        )
+        self._ai_model.addItem("(configured)", None)
+        # Populate with the standard CLIP / Ollama model lists so the
+        # picker has useful defaults even without a network call.
+        for m in ("ViT-B/32", "ViT-B/16", "ViT-L/14", "ViT-L/14@336px",
+                  "RN50", "RN101", "RN50x4"):
+            self._ai_model.addItem(m, m)
+        for m in ("llava:7b", "llava:13b", "llama3.2-vision:11b",
+                  "minicpm-v:8b", "moondream:latest"):
+            self._ai_model.addItem(m, m)
+        self._ai_model.setCurrentIndex(0)
+        self._ai_model.setVisible(False)
+        self._ai_model_label.setVisible(False)
+        # Show the picker when the user picks a backend that takes a model.
+        def _sync_model_picker_visibility():
+            backend = self._ai_backend.currentData()
+            needs_model = backend in ("clip", "ollama")
+            self._ai_model.setVisible(needs_model)
+            self._ai_model_label.setVisible(needs_model)
+        self._ai_backend.currentIndexChanged.connect(
+            lambda _i: _sync_model_picker_visibility()
+        )
+        rnl.addWidget(self._ai_model)
+
+        # Tiny status label next to the AI backend combo showing which
+        # backends are actually wired up. Refreshed when the combo
+        # changes or when the user moves between categories (state may
+        # have changed: e.g. CLIP model loaded between scans).
+        self._ai_status = QLabel("")
+        self._ai_status.setObjectName("statSmall")
+        self._ai_status.setStyleSheet("color: #888;")
+        self._ai_status.setWordWrap(False)
+        rnl.addWidget(self._ai_status)
 
         self._rename_strategy_hint = QLabel("")
         self._rename_strategy_hint.setObjectName("statSmall")
@@ -1668,28 +1799,19 @@ class ReorganizePage(QWidget):
         self._update_undo_label()
         self._load_cats()
 
-    def _on_rename(self):
-        """Open rename dialog for the current category's files."""
-        files = [r[1] for r in self._all_files]
-        if not files:
-            return
-        from ..rename_dialog import RenameDialog
-        strategy = self._rename_strat.currentData() or "sequential"
-        dlg = RenameDialog(
-            files,
-            category=self._cur_cat,
-            parent=self,
-            default_strategy=strategy,
-            max_tags=self._max_tags.value(),
-        )
-        if dlg.exec() == QDialog.Accepted:
-            self._status.setText("Rename complete")
-            self._refresh()
-        else:
-            self._status.setText("Rename cancelled")
-
     def _on_ai_rename(self):
-        """Open the AI Rename dialog for the current selection/view."""
+        """Open the AI Rename dialog for the current selection/view.
+
+        The dialog uses a preview-then-apply flow:
+          1. Pick AI backend / model / strategy.
+          2. Click "Run preview" — generates preview for the first N
+             files (default 5, configurable in the dialog).
+          3. Inspect the proposed names in the preview table.
+          4. Click "Apply" to rename on disk.
+
+        Preview generation runs in a background QThread so the UI
+        never freezes regardless of how slow CLIP / Ollama is.
+        """
         paths = self._current_paths_for_rename()
         if not paths:
             QMessageBox.information(
@@ -1700,19 +1822,25 @@ class ReorganizePage(QWidget):
             return
         from ..ai_rename_dialog import AIRenameDialog
         strategy = self._rename_strat.currentData() or "category_tags"
-        # Default to heuristic — it's safe, instant, and the user
-        # can switch to CLIP/Ollama from inside the dialog. This avoids
-        # the OOM crash we saw when Auto tried Ollama on a large
-        # selection before the user could intervene.
+        # Default to "auto" so the user gets the AI-first cascade
+        # (CLIP → Ollama → Analyzer). They can override inside the
+        # dialog. The AI backend selected in the Reorder header is
+        # passed in so the dialog stays consistent with the main
+        # rename controls.
+        header_backend = (self._ai_backend.currentData()
+                          if hasattr(self, "_ai_backend") else "auto") or "auto"
+        # User explicitly wants max 5 in the preview so they can see
+        # how names are applied without waiting for the full set.
+        preview_cap = min(5, len(paths))
         dlg = AIRenameDialog(
             paths,
             category=self._cur_cat,
             parent=self,
-            default_backend="heuristic",
+            default_backend=header_backend,
             default_strategy=strategy,
             max_tags=self._max_tags.value(),
-            preview_limit=min(50, len(paths)),
-            default_model=self._active_ai_model_for_strategy(),
+            preview_limit=preview_cap,
+            default_model=self._selected_ai_model(),
         )
         if dlg.exec() == QDialog.Accepted:
             self._status.setText("AI Rename complete")
@@ -1737,19 +1865,21 @@ class ReorganizePage(QWidget):
             )
             return
         from ..ai_rename_dialog import AIRenameDialog
-        # If the user has many files in the category, start the preview
-        # cap low so the dialog opens instantly and the user can grow
-        # the cap once they're sure the backend works.
-        cap = 50 if len(paths) > 50 else len(paths)
+        # Preview capped at 5 so the dialog opens instantly and the
+        # user can grow the cap inside the dialog once they're sure
+        # the backend works.
+        preview_cap = min(5, len(paths))
+        header_backend = (self._ai_backend.currentData()
+                          if hasattr(self, "_ai_backend") else "auto") or "auto"
         dlg = AIRenameDialog(
             paths,
             category=self._cur_cat,
             parent=self,
-            default_backend="heuristic",
+            default_backend=header_backend,
             default_strategy="category_tags",
             max_tags=self._max_tags.value(),
-            preview_limit=cap,
-            default_model=self._active_ai_model_for_strategy(),
+            preview_limit=preview_cap,
+            default_model=self._selected_ai_model(),
         )
         if dlg.exec() == QDialog.Accepted:
             self._status.setText(
@@ -1758,6 +1888,16 @@ class ReorganizePage(QWidget):
             self._refresh()
         else:
             self._status.setText("AI Rename cancelled")
+
+    def _selected_ai_model(self) -> str:
+        """Return the explicit model name from the header picker, or ''
+        for '(configured)' so the dialog inherits the configured model."""
+        if not hasattr(self, "_ai_model"):
+            return ""
+        text = self._ai_model.currentText().strip()
+        if not text or text == "(configured)":
+            return ""
+        return text
 
     def _active_ai_model_for_strategy(self) -> str:
         """Return the active model from settings (CLIP or Ollama).
@@ -1803,11 +1943,22 @@ class ReorganizePage(QWidget):
         strat = self._rename_strat.currentData() or ""
         is_tag = strat in TAG_BASED_STRATEGIES
         self._cb_rename_prefix.setEnabled(strat == "category" or is_tag)
+        # AI backend selector only matters for tag-based strategies.
+        # When the strategy doesn't use tags, hide the controls so the
+        # header stays clean.
+        self._ai_backend_label.setVisible(is_tag)
+        self._ai_backend.setVisible(is_tag)
+        self._ai_status.setVisible(is_tag)
         if is_tag:
+            backend = self._ai_backend.currentData() or "auto"
+            backend_label = self._ai_backend.currentText()
             self._rename_strategy_hint.setText(
-                "Tag-based: tags are detected from the image using the "
-                "heuristic CV pipeline (no AI). First-time use may take a few seconds."
+                f"Tag-based: {backend_label}. The backend detects content "
+                "(anime / cyberpunk / portrait / ...) for each image and "
+                "embeds the top tags in the filename. First-time use "
+                "may take a few seconds per image."
             )
+            self._refresh_ai_status()
         elif strat == "category":
             self._rename_strategy_hint.setText(
                 "Files are renamed to <Category>_NNN.jpg as they are moved."
@@ -1821,42 +1972,81 @@ class ReorganizePage(QWidget):
             self._rename_strategy_hint.setText("")
         self._refresh_rename_buttons()
 
+    def _refresh_ai_status(self):
+        """Probe CLIP / Ollama availability for the AI backend status label.
+
+        Cheap probes (no model load) — runs once when the dialog opens
+        and again whenever the user changes the backend dropdown.
+        """
+        # Only relevant when the selector is visible (tag-based strategy).
+        if not self._ai_backend.isVisible():
+            return
+        # CLIP probe.
+        clip_ok = False
+        try:
+            from ...clip_client import get_engine
+            engine = get_engine()
+            clip_ok = bool(engine.available)
+        except Exception:
+            clip_ok = False
+        # Ollama probe (network call with short timeout).
+        ollama_ok = False
+        try:
+            from ...ollama_client import OllamaClient
+            cfg = s.load_settings()
+            client = OllamaClient(
+                base_url=cfg.get("ollama_url", "http://localhost:11434"),
+                timeout=2,
+            )
+            try:
+                ollama_ok = bool(client.list_models())
+            finally:
+                client.close()
+        except Exception:
+            ollama_ok = False
+
+        backend = self._ai_backend.currentData()
+        if backend == "clip":
+            if clip_ok:
+                self._ai_status.setText("✓ CLIP loaded")
+                self._ai_status.setStyleSheet("color: #6fbf73;")
+            else:
+                self._ai_status.setText("✗ CLIP not loaded")
+                self._ai_status.setStyleSheet("color: #c95;")
+        elif backend == "ollama":
+            if ollama_ok:
+                self._ai_status.setText("✓ Ollama reachable")
+                self._ai_status.setStyleSheet("color: #6fbf73;")
+            else:
+                self._ai_status.setText("✗ Ollama unreachable")
+                self._ai_status.setStyleSheet("color: #c95;")
+        elif backend == "heuristic":
+            self._ai_status.setText("(no AI, CV only)")
+            self._ai_status.setStyleSheet("color: #888;")
+        else:  # auto
+            bits = []
+            if clip_ok:
+                bits.append("CLIP ✓")
+            if ollama_ok:
+                bits.append("Ollama ✓")
+            if not bits:
+                self._ai_status.setText(
+                    "no AI backend — will use analyzer"
+                )
+                self._ai_status.setStyleSheet("color: #c95;")
+            else:
+                cascade = " → ".join(bits + ["Analyzer"])
+                self._ai_status.setText(f"cascade: {cascade}")
+                self._ai_status.setStyleSheet("color: #888;")
+
     def _refresh_rename_buttons(self):
         """Enable rename buttons only when there are visible files."""
         has_files = bool(self._visible or self._all_files)
-        self.btn_rename.setEnabled(has_files)
-        self.btn_rename_only.setEnabled(has_files)
         self.btn_ai_rename.setEnabled(has_files)
         # The category-wide AI rename is enabled whenever a category is
         # selected — even with an empty visible selection, the user
         # may want to rename every file in the category.
         self.btn_ai_rename_cat.setEnabled(bool(self._cur_cat))
-
-    def _on_rename_only(self):
-        """Rename the currently visible files in place — no move.
-
-        Uses the strategy / max-tags controls in the header. Tag-based
-        strategies auto-detect tags via the heuristic CV pipeline.
-        """
-        paths = self._current_paths_for_rename()
-        if not paths:
-            return
-        strategy = self._rename_strat.currentData() or "sequential"
-        max_tags = self._max_tags.value()
-        # Use the current category (if any) for tag boosting.
-        category_hint = self._cur_cat or ""
-
-        # Compute pairs in a background thread so tag analysis doesn't
-        # freeze the UI on large selections.
-        self._set_busy(True, "Detecting tags + building new names...")
-        self._run_rename_job(
-            paths=paths,
-            target_dir=None,  # in-place
-            strategy=strategy,
-            category=category_hint,
-            max_tags=max_tags,
-            mode="rename_only",
-        )
 
     def _current_paths_for_rename(self) -> List[str]:
         """Return the path list the user wants to operate on.
@@ -1876,17 +2066,27 @@ class ReorganizePage(QWidget):
         """Compute rename pairs in a worker and apply them.
 
         `mode` is 'rename_only' (in-place) or 'move' (move+rename).
+
+        For tag-based strategies the worker uses the AI backend selected
+        in the header (default "auto" = CLIP → Ollama → Analyzer) so
+        the rename produces content-aware filenames.
         """
         if hasattr(self, "_rename_job") and self._rename_job and self._rename_job.isRunning():
             QMessageBox.information(self, "Busy", "A rename job is already running.")
             return
 
+        ai_backend = (self._ai_backend.currentData()
+                      if hasattr(self, "_ai_backend") else "auto") or "auto"
+        ai_model = self._active_ai_model_for_strategy()
         self._rename_job = _RenameJob(
             paths=paths,
             target_dir=target_dir,
             strategy=strategy,
             category=category,
             max_tags=max_tags,
+            ai_backend=ai_backend,
+            ai_mode="auto",  # always use the configured organise mode for the analyzer fallback
+            ai_model=ai_model,
         )
         self._rename_job.progress.connect(self._on_rename_progress)
         self._rename_job.finished_ok.connect(self._on_rename_done)
@@ -1901,6 +2101,8 @@ class ReorganizePage(QWidget):
         moved = result.get("moved", 0)
         errors = result.get("errors", 0)
         strategy = result.get("strategy", "")
+        ai_backend = result.get("ai_backend")
+        ai_log = result.get("ai_log") or []
         self._set_busy(False)
         target_cat = getattr(self, "_pending_move_target", None)
         src_cats = getattr(self, "_pending_move_src_cats", {}) or {}
@@ -1922,6 +2124,14 @@ class ReorganizePage(QWidget):
             msg = f"Renamed {renamed} files"
             if moved:
                 msg += f"  ({moved} moved across folders)"
+        # Append AI summary for tag-based strategies so the user can see
+        # at a glance what tags were assigned.
+        if ai_backend and ai_log:
+            sample = " · ".join(ai_log[:3])
+            extra = f"  |  AI ({ai_backend}): {sample}"
+            if len(ai_log) > 3:
+                extra += f"  (+{len(ai_log) - 3} more)"
+            msg += extra
         if errors:
             msg += f"  |  {errors} errors"
         self._status.setText(msg)
@@ -1954,8 +2164,6 @@ class ReorganizePage(QWidget):
         self.cb_rename.setEnabled(not busy)
         self._rename_strat.setEnabled(not busy)
         self._max_tags.setEnabled(not busy)
-        self.btn_rename_only.setEnabled(not busy and bool(self._all_files))
-        self.btn_rename.setEnabled(not busy and bool(self._all_files))
         if busy and message:
             self._status.setText(message)
         elif not busy:

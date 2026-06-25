@@ -1,17 +1,24 @@
 """Duplicates page: scan and remove duplicate wallpapers across the entire dest dir.
 
 Supports:
-  - MD5-only duplicate detection (byte-identical files)
+  - MD5 (byte-identical) duplicate detection
+  - Perceptual (image-content-aware) detection: catches the same image
+    re-encoded as JPG vs PNG, re-compressed, resized, or saved under
+    a different container. Uses dHash + pHash + colour histogram,
+    bucketed via LSH on a 16-bit coarse dHash for fast candidate
+    filtering.
+  - Tiers: exact (MD5), reencode (same content, different bytes),
+    resize (different resolution), similar (visually close).
   - Cross-category detection
   - Per-group decision: keep one, move/delete the rest
   - Filter: same-category only
-  - Live stats broken down by file kind
+  - Live stats broken down by file kind and tier
   - Background worker with cancellation
 """
 import os
 from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QWidget, QGroupBox, QFormLayout, QCheckBox,
+    QWidget, QGroupBox, QFormLayout, QCheckBox, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QPlainTextEdit, QMessageBox, QProgressBar,
 )
@@ -19,15 +26,15 @@ from PySide6.QtCore import QTimer, QThread, Signal
 from ... import settings as s
 from ... import categories as c
 from ...duplicates import (
-    scan_and_hash, find_duplicate_groups, get_duplicate_stats,
+    scan_and_hash, scan_and_hash_perceptual,
+    find_duplicate_groups, get_duplicate_stats,
     move_to_duplicates, delete_files, save_hash_cache, load_hash_cache,
+    TIER_LABELS, TIER_EXACT, TIER_REENCODE, TIER_RESIZE, TIER_SIMILAR,
 )
 from ..widgets import BTN_TEXT, BTN_KIND, BTN_DATA, setup_table_buttons, refresh_action_columns
 
 
-TIER_LABELS = {
-    "exact": "Exact (same MD5)",
-}
+TIER_ORDER = [TIER_EXACT, TIER_REENCODE, TIER_RESIZE, TIER_SIMILAR]
 
 
 def _collect_all_files(dest_dir: str) -> list:
@@ -60,10 +67,12 @@ class DupeScanWorker(QThread):
     finished_ok = Signal(list, dict)
     failed = Signal(str)
 
-    def __init__(self, files, same_category_only, cache):
+    def __init__(self, files, same_category_only, perceptual, min_tier, cache):
         super().__init__()
         self.files = files
         self.same_category_only = same_category_only
+        self.perceptual = perceptual
+        self.min_tier = min_tier
         self.cache = cache
         self._cancel = False
 
@@ -73,6 +82,8 @@ class DupeScanWorker(QThread):
     def run(self):
         try:
             self.log.emit(f"Scanning {len(self.files)} files...")
+            self.stage.emit("MD5", "md5", 0, len(self.files))
+
             def cb(cur, total, fn, st):
                 self.progress.emit(cur, total, os.path.basename(fn), st)
                 if self._cancel:
@@ -82,11 +93,29 @@ class DupeScanWorker(QThread):
             except _ScanCancelled:
                 self.log.emit("[CANCELLED]")
                 return
-            self.log.emit("Hashing complete. Finding duplicates...")
             if self._cancel:
                 return
+
+            if self.perceptual:
+                self.log.emit("Computing perceptual hashes...")
+                self.stage.emit("Perceptual", "perceptual", 0, len(self.files))
+                try:
+                    scan_and_hash_perceptual(
+                        self.files, self.cache, progress_callback=cb, parallel=4,
+                    )
+                except _ScanCancelled:
+                    self.log.emit("[CANCELLED]")
+                    return
+                if self._cancel:
+                    return
+
+            self.log.emit(f"Finding duplicates (mode={'soft' if self.perceptual else 'hard'}, "
+                          f"min_tier={self.min_tier})...")
+            self.stage.emit("Grouping", "group", 0, 1)
             groups = find_duplicate_groups(
                 self.files, self.cache,
+                mode='soft' if self.perceptual else 'hard',
+                min_tier=self.min_tier,
                 same_category_only=self.same_category_only,
             )
             stats = get_duplicate_stats(groups)
@@ -109,12 +138,14 @@ class DuplicatesPage(QWidget):
         l = QVBoxLayout(self)
         l.setContentsMargins(24, 24, 24, 24)
 
-        t = QLabel("Duplicate Detection (MD5)")
+        t = QLabel("Duplicate Detection")
         t.setObjectName("title")
         l.addWidget(t)
         st = QLabel(
-            "Find and remove byte-identical wallpapers across all categories. "
-            "Two files are duplicates when they share the same MD5 hash."
+            "Find and remove duplicate wallpapers across all categories. "
+            "MD5 catches byte-identical copies; perceptual detection "
+            "catches the same image re-encoded (JPG\u2194PNG, re-compressed, "
+            "resized, different container)."
         )
         st.setObjectName("subtitle")
         st.setWordWrap(True)
@@ -125,6 +156,27 @@ class DuplicatesPage(QWidget):
         self._same_cat = QCheckBox("Restrict to within same category")
         self._same_cat.setChecked(False)
         ol.addRow(self._same_cat)
+
+        self._perceptual = QCheckBox(
+            "Perceptual detection (catches re-encoded / resized copies)"
+        )
+        self._perceptual.setChecked(True)
+        ol.addRow(self._perceptual)
+
+        self._min_tier = QComboBox()
+        for tier in TIER_ORDER:
+            label = TIER_LABELS.get(tier, tier)
+            self._min_tier.addItem(label, tier)
+        self._min_tier.setCurrentIndex(0)  # exact
+        self._min_tier.setToolTip(
+            "Strictest tier to report in the perceptual pass.\n"
+            "  exact    - byte-identical files (MD5)\n"
+            "  reencode - same image, different format / quality\n"
+            "  resize   - same image, different resolution\n"
+            "  similar  - visually close (broader)"
+        )
+        self._perceptual.toggled.connect(self._min_tier.setEnabled)
+        ol.addRow("Min tier (perceptual):", self._min_tier)
         l.addWidget(opts)
 
         act = QHBoxLayout()
@@ -155,15 +207,17 @@ class DuplicatesPage(QWidget):
         self._stats_lbl.setWordWrap(True)
         l.addWidget(self._stats_lbl)
 
-        # Columns: # | Files in group (with keep marker) | MD5 | Same size | Action
-        self._table = QTableWidget(0, 5)
+        # Columns: # | Files in group (with keep marker) | Tier | Signature | Same size | Action
+        self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(
-            ["#", "Files (\u2713 = kept)", "MD5", "Same size", "Action"])
+            ["#", "Files (\u2713 = kept)", "Tier", "Signature",
+             "Same size", "Action"])
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self._table.setAlternatingRowColors(True)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -229,10 +283,18 @@ class DuplicatesPage(QWidget):
         self._progress.setVisible(True)
         self._progress.setMaximum(len(files))
         self._progress.setValue(0)
-        self._log.appendPlainText(f"Starting MD5 scan of {len(files)} files...")
+        perceptual = self._perceptual.isChecked()
+        min_tier = self._min_tier.currentData() or TIER_EXACT
+        mode_label = "MD5 + perceptual" if perceptual else "MD5 only"
+        self._log.appendPlainText(
+            f"Starting {mode_label} scan of {len(files)} files "
+            f"(min_tier={min_tier})..."
+        )
         self._worker = DupeScanWorker(
             files,
             self._same_cat.isChecked(),
+            perceptual,
+            min_tier,
             self._cache,
         )
         self._worker.log.connect(self._log.appendPlainText)
@@ -255,10 +317,11 @@ class DuplicatesPage(QWidget):
             self._log.appendPlainText(f"  [{cur}/{total}] {fn}: {st}")
 
     def _on_stage(self, label, name, cur, total):
-        # No-op: MD5-only detection doesn't have a separate verification
-        # stage to progress through. Kept for API compatibility with
-        # the worker.
-        pass
+        # Stage labels are emitted by the worker (MD5 / Perceptual /
+        # Grouping). We surface them as section headers in the log so
+        # the user knows which phase is running.
+        if cur == 0:
+            self._log.appendPlainText(f"[stage] {label}")
 
     def _on_done(self, groups, stats):
         self._groups = groups
@@ -294,19 +357,33 @@ class DuplicatesPage(QWidget):
             files_item.setToolTip("\n".join(files_lines))
             self._table.setItem(i, 1, files_item)
 
-            md5_text = g.get("md5", "")
-            md5_item = QTableWidgetItem(md5_text[:12] + "..." if len(md5_text) > 12 else md5_text)
-            md5_item.setToolTip(md5_text or "(no md5)")
-            self._table.setItem(i, 2, md5_item)
+            tier = g.get("tier", TIER_EXACT)
+            tier_item = QTableWidgetItem(TIER_LABELS.get(tier, tier))
+            tier_item.setToolTip(tier)
+            self._table.setItem(i, 2, tier_item)
+
+            md5_text = g.get("md5") or ""
+            if md5_text:
+                sig_text = md5_text[:12] + ("..." if len(md5_text) > 12 else "")
+                sig_tooltip = "MD5: " + md5_text
+            elif g.get("score") is not None:
+                sig_text = f"{g['score']:.2f}"
+                sig_tooltip = "Perceptual similarity score"
+            else:
+                sig_text = "\u2014"
+                sig_tooltip = "(no signature)"
+            sig_item = QTableWidgetItem(sig_text)
+            sig_item.setToolTip(sig_tooltip)
+            self._table.setItem(i, 3, sig_item)
 
             sm = QTableWidgetItem("Yes" if g.get("size_match") else "No")
-            self._table.setItem(i, 3, sm)
+            self._table.setItem(i, 4, sm)
 
             act = QTableWidgetItem()
             act.setData(BTN_TEXT, "Move|Del")
             act.setData(BTN_KIND, "action|del")
             act.setData(BTN_DATA, str(i))
-            self._table.setItem(i, 4, act)
+            self._table.setItem(i, 5, act)
 
         refresh_action_columns(self._table)
         self._table.resizeRowsToContents()
@@ -318,7 +395,7 @@ class DuplicatesPage(QWidget):
             elif c == 1:
                 self._delete_group(idx)
 
-        setup_table_buttons(self._table, {"action": _on_action, "del": _on_action}, [4])
+        setup_table_buttons(self._table, {"action": _on_action, "del": _on_action}, [5])
 
     def _move_group(self, idx):
         if idx >= len(self._groups):
@@ -406,10 +483,16 @@ def _format_stats(stats: dict) -> str:
     for ext in sorted(by_kind):
         kind_parts.append(f"{by_kind[ext]} {ext.lstrip('.')}")
     kind_breakdown = " [" + ", ".join(kind_parts) + "]" if kind_parts else ""
+    by_tier = stats.get("by_tier", {})
+    tier_parts = []
+    for tier in TIER_ORDER:
+        if tier in by_tier:
+            tier_parts.append(f"{TIER_LABELS.get(tier, tier)}: {by_tier[tier]}")
+    tier_breakdown = " (" + ", ".join(tier_parts) + ")" if tier_parts else ""
     wasted_mb = stats.get("wasted_mb", 0)
     return (
         f"{stats['total_groups']} duplicate groups, "
         f"{stats['total_duplicates']} duplicate files"
-        f"{kind_breakdown}, "
+        f"{tier_breakdown}{kind_breakdown}, "
         f"~{wasted_mb:.1f} MB wasted"
     )

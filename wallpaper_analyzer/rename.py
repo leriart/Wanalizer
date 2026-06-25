@@ -32,7 +32,7 @@ import hashlib
 import unicodedata
 from collections import OrderedDict
 from datetime import datetime
-from typing import List, Tuple, Callable, Dict, Optional
+from typing import FrozenSet, List, Tuple, Callable, Dict, Optional
 
 
 def split_ext(filename: str) -> Tuple[str, str]:
@@ -613,7 +613,10 @@ def _clip_tag_vocab() -> List[str]:
     inside ``_clip_detect_tags`` and explicitly drop the tensors.
     """
     global _CLIP_TAG_VOCAB
-    if _CLIP_TAG_VOCAB is not None:
+    # Rebuild when missing OR empty (an empty cache must always rebuild
+    # so tests that explicitly clear() it don't lock in a permanent zero
+    # state across processes).
+    if _CLIP_TAG_VOCAB:
         return _CLIP_TAG_VOCAB
     try:
         from .tags import _tags_flat
@@ -627,6 +630,12 @@ def _clip_tag_vocab() -> List[str]:
 
 # Backend identifiers accepted by ai_detect_tags() / AIRenamer
 AI_TAG_BACKENDS = ("auto", "heuristic", "clip", "ollama")
+
+# Analyzer modes the AI renamer can run on top of. Each mode is the
+# SAME analyzer the organize pipeline uses for category assignment,
+# so the tags come from the same content analysis that picked the
+# category. Default ("auto") picks the configured organize_mode.
+AI_TAG_MODES = ("auto", "lowlevel", "fusion", "clip", "ollama")
 
 
 # ---------------------------------------------------------------------------
@@ -652,15 +661,46 @@ AI_TAG_BACKENDS = ("auto", "heuristic", "clip", "ollama")
 
 
 class AIRenamer:
-    """Stateful AI rename engine. Use one instance per batch."""
+    """Stateful AI rename engine. Use one instance per batch.
+
+    Tag detection is now analyzer-driven: by default the same
+    `BaseAnalyzer` (lowlevel / fusion / clip / ollama) that the
+    organize pipeline uses for category assignment also picks the
+    descriptive tags for renaming. This means the rename output is
+    always consistent with the category the user assigned — "anime"
+    gets anime-style content tags, "nature" gets nature-style tags,
+    etc. — instead of the previous colour-biased heuristic that
+    couldn't tell a forest from an anime beach.
+
+    Args:
+        backend: tag-source backend ("auto", "heuristic", "clip",
+            "ollama"). Determines WHERE the tags come from:
+              - "heuristic" → analyzer-driven content analysis
+                (this is now the recommended default; picks up CLIP
+                scores + fingerprint + content + theme signals when
+                the chosen analyzer exposes them).
+              - "clip" → curated CLIP vocabulary (legacy).
+              - "ollama" → local vision LLM (legacy).
+              - "auto" → cascade analyzer → ollama → clip → heuristic.
+        mode: analyzer mode ("auto", "lowlevel", "fusion", "clip",
+            "ollama"). Defaults to "auto" which uses the user's
+            configured `organize_mode` from settings.
+        model: optional model override (for CLIP / Ollama backends).
+        max_tags: cap on the returned tag list per file.
+        cache_size: in-memory cache size for the AIRenamer's own LRU.
+        force_reprocess: bypass the per-file cache and re-detect
+            every image even if it was already processed in this batch.
+    """
 
     def __init__(self,
                  backend: str = "auto",
+                 mode: str = "auto",
                  model: Optional[str] = None,
                  max_tags: int = 8,
                  cache_size: int = 4096,
                  force_reprocess: bool = False):
         self.backend = backend if backend in AI_TAG_BACKENDS else "heuristic"
+        self.mode = mode if mode in AI_TAG_MODES else "auto"
         self.model = model or None
         self.max_tags = max_tags
         self._cache_size = cache_size
@@ -672,6 +712,8 @@ class AIRenamer:
         self._ollama_client = None  # lazily opened, reused across files
         self._ollama_url = None
         self._ollama_model = None
+        self._analyzer = None          # lazily built analyzer for content-aware path
+        self._analyzer_mode_resolved: Optional[str] = None  # for logging
         # Counters (read by callers / status bars).
         self.processed = 0
         self.failed = 0
@@ -800,7 +842,192 @@ class AIRenamer:
             return [], None
 
     def _heuristic_detect(self, path: str, category: Optional[str]) -> Tuple[List[str], Optional[str]]:
-        return get_tags_for_file(path, category=category, max_tags=self.max_tags)
+        """Content-aware tag detection via the configured analyzer.
+
+        This is the same analyzer pipeline the organize pass uses for
+        category assignment (lowlevel / fusion / clip / ollama, picked
+        by `self.mode`). It runs `analyzer.analyze(path)` to build the
+        full feature profile (low-level CV + content detectors + theme
+        + fingerprint + CLIP scores if available) and then derives the
+        tag list from `classify_with_confidence(profile)["tags"]` — the
+        content-aware set built by `tag_suggester.suggest_tags`.
+
+        Result: tags describe the image's CONTENT (anime, cyberpunk,
+        space, neon, portrait, pixel-art, minimalist, ...) — not just
+        colours.
+        """
+        analyzer = self._ensure_analyzer()
+        if analyzer is None:
+            # No analyzer available — fall back to the legacy heuristic
+            # so the rename still produces something.
+            return get_tags_for_file(path, category=category, max_tags=self.max_tags)
+        try:
+            tags, subject = analyzer.detect_tags(path, max_tags=self.max_tags)
+        except Exception as e:
+            self._emit("analyzer_err", f"{os.path.basename(path)}: {e}")
+            return [], None
+        return tags, subject
+
+    # ---------------- combined registry-aware classifier ----------------
+
+    # Tag tokens that describe *colour only* — they don't carry any
+    # content information. When the result has both content and colour
+    # tags we want to surface the content tags first; colour tokens are
+    # only kept as a last resort (no content detected) or as trailing
+    # descriptors when there's room left after the content tags.
+    _COLOUR_ONLY_TOKENS: FrozenSet[str] = frozenset({
+        "red", "green", "blue", "yellow", "black", "white", "gray",
+        "grey", "orange", "purple", "pink", "brown", "cyan", "magenta",
+        "teal", "maroon", "navy", "olive", "lime", "aqua", "fuchsia",
+        "silver", "gold", "beige", "tan", "khaki", "coral", "salmon",
+        "ivory", "crimson", "turquoise", "lavender", "indigo", "violet",
+        "rose", "amber", "mint", "peach", "plum", "ruby", "sapphire",
+        "scarlet", "azure", "bronze", "cherry", "copper", "emerald",
+    })
+
+    @classmethod
+    def _is_colour_token(cls, tag: str) -> bool:
+        return tag.lower() in cls._COLOUR_ONLY_TOKENS
+
+    def _combined_classify(self, path: str,
+                           category: Optional[str] = None
+                           ) -> Tuple[List[str], Optional[str]]:
+        """Combine CLIP semantic + analyzer content + suggest_tags.
+
+        Three independent signals are merged, each contributing what it's
+        best at:
+
+          1. **CLIP semantic match** (when installed) — encodes the
+             image once, scores against the FULL tag registry
+             (~1.5k tags), returns top-K by cosine similarity. Best at
+             generic semantic recognition ("tokyo-night", "elf",
+             "cyberpunk-era", ...).
+          2. **Analyzer content heuristics** — runs the configured
+             analyzer pipeline (same one the organize pass uses for
+             category assignment) to get `classify_with_confidence`
+             tags. Best at project-specific content signals driven by
+             the curated registry (anime / cyberpunk / portrait /
+             nature / ...).
+          3. **suggest_tags from the profile** — runs the full heuristic
+             tag suggester (anime_score, cyberpunk_score, neon_score,
+             content detectors, palette, composition). Best at the
+             curated content tags the user has defined.
+
+        The merged list is **content-first**: every pure-colour token
+        is moved to the back so content tags always surface first.
+        The result always has at least one tag when any of the three
+        signals produced anything — even on solid-colour images where
+        CLIP legitimately returns colour tokens.
+        """
+        seen: set = set()
+        ordered: List[str] = []  # preserves priority: CLIP > analyzer > suggest_tags
+        sources_used: List[str] = []
+
+        # 1. CLIP semantic match (priority 1).
+        try:
+            clip_tags, _ = self._clip_detect(path)
+            for t in clip_tags:
+                tl = t.lower().strip()
+                if tl and tl not in seen:
+                    seen.add(tl)
+                    ordered.append(tl)
+            if clip_tags:
+                sources_used.append("clip")
+        except Exception:
+            pass
+
+        # 2. Analyzer content signals (priority 2).
+        analyzer = self._ensure_analyzer()
+        if analyzer is not None:
+            try:
+                info = analyzer.classify_with_confidence(
+                    analyzer.analyze(path)
+                ) if hasattr(analyzer, "classify_with_confidence") else {}
+                analyzer_tags = info.get("tags") or set()
+                # suggest_tags returns a set with no order — sort for
+                # determinism (longer content words tend to be more
+                # specific, but we keep the registry's natural order).
+                for t in sorted(analyzer_tags):
+                    tl = t.lower().strip()
+                    if tl and tl not in seen:
+                        seen.add(tl)
+                        ordered.append(tl)
+                if analyzer_tags:
+                    sources_used.append("analyzer")
+            except Exception:
+                pass
+
+        # 3. Full suggest_tags (priority 3, fills gaps).
+        try:
+            from .profile import get_image_profile
+            from .tag_suggester import suggest_tags, suggest_tags_for_category
+            profile = get_image_profile(path)
+            cat = category or profile.get("_current_category") or "default"
+            base = suggest_tags(profile, max_tags=self.max_tags * 3)
+            base = set(t.lower() for t in base)
+            for t in sorted(base):
+                tl = t.lower().strip()
+                if tl and tl not in seen:
+                    seen.add(tl)
+                    ordered.append(tl)
+            if base:
+                sources_used.append("suggest_tags")
+            # Also pick up the category itself when present in the
+            # registry — useful as a content hint for known categories.
+            if cat and cat.lower() in (t.lower() for t in __import__(
+                    "wallpaper_analyzer.tags", fromlist=["_tags_flat"]
+            )._tags_flat):
+                if cat.lower() not in seen:
+                    seen.add(cat.lower())
+                    ordered.append(cat.lower())
+        except Exception:
+            pass
+
+        if not ordered:
+            return [], None
+
+        # Re-order so content tags always come first. This is the key
+        # guarantee for the user: the rename output describes the
+        # image's CONTENT, not just its colour. Pure-colour tokens are
+        # pushed to the end (and dropped if we exceed max_tags).
+        content_first = [t for t in ordered if not self._is_colour_token(t)]
+        colour_last = [t for t in ordered if self._is_colour_token(t)]
+        merged = content_first + colour_last
+        trimmed = merged[:self.max_tags]
+        if sources_used:
+            self._emit("combined", f"sources=[{','.join(sources_used)}] "
+                                   f"content={len(content_first)} "
+                                   f"colour={len(colour_last)}")
+        subject = trimmed[0] if trimmed else None
+        return trimmed, subject
+
+    # ---------------- analyzer lifecycle ----------------
+
+    # ---------------- analyzer lifecycle ----------------
+
+    def _ensure_analyzer(self):
+        """Lazily build the analyzer used for content-aware tag detection.
+
+        Resolves the effective mode:
+          - "auto" → uses the user's configured `organize_mode` from settings.
+          - explicit mode → uses that mode directly.
+        """
+        if self._analyzer is not None:
+            return self._analyzer
+        try:
+            from . import settings as _settings
+            from .analyzers import get_analyzer
+            cfg = _settings.load_settings()
+            requested = self.mode if self.mode != "auto" else cfg.get(
+                "organize_mode", "lowlevel")
+            requested = requested if requested in AI_TAG_MODES else "lowlevel"
+            self._analyzer = get_analyzer(requested, cfg)
+            self._analyzer_mode_resolved = requested
+            self._emit("analyzer_init", f"Analyzer ready ({requested})")
+        except Exception as e:
+            self._emit("analyzer_init", f"Could not init analyzer: {e}")
+            self._analyzer = None
+        return self._analyzer
 
     # ---------------- single-file entry point ----------------
 
@@ -839,15 +1066,27 @@ class AIRenamer:
                 if not tags and not subject:
                     self._emit("fallback", "CLIP returned no tags")
             elif backend == "heuristic":
-                tags, subject = self._heuristic_detect(path, category)
-            else:  # auto — cascade Ollama → CLIP → heuristic
-                tags, subject = self._ollama_detect(path)
+                # Heuristic = analyzer content heuristics (no AI model).
+                # The combined classifier is the "all project tags" path
+                # which is what the user actually wants — try that first
+                # when AI is available.
+                tags, subject = self._combined_classify(path, category)
                 if not tags and not subject:
-                    self._emit("auto_fallback", "Ollama failed, trying CLIP")
-                    tags, subject = self._clip_detect(path)
-                if not tags and not subject:
-                    self._emit("auto_fallback", "CLIP failed, using heuristic")
                     tags, subject = self._heuristic_detect(path, category)
+            else:  # auto — combined AI + analyzer for the most reliable result
+                # The combined classifier merges CLIP semantic + analyzer
+                # content + suggest_tags into a single content-first tag
+                # list. When no AI is installed, it falls back to the
+                # analyzer heuristics via _heuristic_detect.
+                tags, subject = self._combined_classify(path, category)
+                if not tags and not subject:
+                    self._emit("auto_fallback",
+                               "Combined classifier empty, trying Ollama directly")
+                    tags, subject = self._ollama_detect(path)
+                if not tags and not subject:
+                    self._emit("auto_fallback",
+                               "No tags from any backend, using colour fallback")
+                    tags, subject = [], None
 
             # Always wrap with deterministic fallback so the result
             # is never empty — augments AI tags with colour/aspect tokens.
@@ -911,16 +1150,22 @@ def ai_detect_tags(
     max_tags: int = 8,
     model: Optional[str] = None,
     progress_cb=None,
+    mode: str = "auto",
 ) -> Tuple[List[str], Optional[str]]:
     """Single-file AI tag detection (uses a temporary AIRenamer).
 
     New code should construct an AIRenamer directly so the Ollama
     HTTP client and per-file cache are reused across the batch.
+
+    Args:
+        mode: analyzer mode ("auto"/"lowlevel"/"fusion"/"clip"/"ollama").
+            Default "auto" picks up the user's configured `organize_mode`
+            so the rename uses the same analyzer that picked the category.
     """
     global _AIRENAMER_GLOBAL_CB
     _AIRENAMER_GLOBAL_CB = progress_cb
     try:
-        ren = AIRenamer(backend=backend, model=model, max_tags=max_tags)
+        ren = AIRenamer(backend=backend, mode=mode, model=model, max_tags=max_tags)
         try:
             return ren.detect_tags(image_path, category=category)
         finally:
@@ -941,6 +1186,7 @@ def ai_compute_renames(
     model: Optional[str] = None,
     progress_cb=None,
     force_reprocess: bool = False,
+    mode: str = "auto",
 ) -> List[Tuple[str, str]]:
     """Build rename pairs using AI-detected tags.
 
@@ -950,6 +1196,9 @@ def ai_compute_renames(
 
     Args:
         ... (see AIRenamer for the rest)
+        mode: analyzer mode ("auto"/"lowlevel"/"fusion"/"clip"/"ollama").
+            Default "auto" picks up the user's configured `organize_mode`
+            so the rename uses the same analyzer that picked the category.
         force_reprocess: bypass the per-file cache and re-detect every
             image even if it was already processed in this batch.
     """
@@ -961,7 +1210,7 @@ def ai_compute_renames(
         )
 
     ren = AIRenamer(
-        backend=backend, model=model, max_tags=max_tags,
+        backend=backend, mode=mode, model=model, max_tags=max_tags,
         force_reprocess=force_reprocess,
     )
     try:

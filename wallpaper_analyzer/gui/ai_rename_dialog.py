@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..rename import (
-    RENAME_STRATEGIES, TAG_BASED_STRATEGIES, AI_TAG_BACKENDS,
+    RENAME_STRATEGIES, TAG_BASED_STRATEGIES, AI_TAG_BACKENDS, AI_TAG_MODES,
     ai_compute_renames, apply_renames,
 )
 
@@ -122,7 +122,7 @@ class _PreviewJob(QThread):
     failed = Signal(str)
 
     def __init__(self, files, strategy, backend, category, max_tags,
-                 model=None, force_reprocess=False):
+                 model=None, force_reprocess=False, mode="auto"):
         super().__init__()
         self.files = list(files)
         self.strategy = strategy
@@ -131,6 +131,7 @@ class _PreviewJob(QThread):
         self.max_tags = max_tags
         self.model = model
         self.force_reprocess = force_reprocess
+        self.mode = mode
         self._cancel = False
         # Filled in by run(); used by the slot to surface per-file stats.
         self.renamer: Optional[object] = None
@@ -145,6 +146,7 @@ class _PreviewJob(QThread):
             log: List[str] = []
             ren = AIRenamer(
                 backend=self.backend,
+                mode=self.mode,
                 model=self.model,
                 max_tags=self.max_tags,
                 force_reprocess=self.force_reprocess,
@@ -153,7 +155,11 @@ class _PreviewJob(QThread):
 
             # Emit batch-level progress (count of files).
             total = len(self.files)
-            self.progress.emit(0, total, f"Processing {total} files with {self.backend}…")
+            self.progress.emit(
+                0, total,
+                f"Processing {total} files with {self.backend}"
+                f" (mode={self.mode})…",
+            )
 
             # Iterate per-file so we can emit granular progress events.
             # detect_tags() never raises — failures are isolated and
@@ -206,7 +212,7 @@ class AIRenameDialog(QDialog):
     """
 
     def __init__(self, files: List[str], category: str = "",
-                 default_backend: str = "heuristic",
+                 default_backend: str = "auto",
                  default_strategy: str = "category_tags",
                  max_tags: int = 3,
                  preview_limit: int = 50,
@@ -248,22 +254,61 @@ class AIRenameDialog(QDialog):
         bg_layout = QFormLayout(bg)
         self._backend = QComboBox()
         labels = {
-            "auto":      "Auto (Ollama → CLIP → Heuristic)",
-            "heuristic": "Heuristic (no AI, fast CV only)",
-            "clip":      "CLIP (local OpenAI model)",
+            "auto":      "Auto (CLIP → Ollama → Analyzer — recommended)",
+            "heuristic": "Analyzer (same as category assignment, no AI)",
+            "clip":      "CLIP (local OpenAI model — semantic match against registry)",
             "ollama":    "Ollama (local vision LLM)",
         }
         for k in AI_TAG_BACKENDS:
             self._backend.addItem(labels.get(k, k), k)
-        # Default to "heuristic" — it's the safest option and lets the
-        # user upgrade to a heavier backend when they're ready.
+        # Default to "auto" so the user gets AI-driven semantic tag
+        # detection against the full registry (CLIP if installed,
+        # Ollama otherwise). This matches the user's explicit request:
+        # "use AI to use the available tags and classify the images".
         idx = self._backend.findData(default_backend)
         if idx < 0:
-            idx = self._backend.findData("heuristic")
+            idx = self._backend.findData("auto")
         if idx >= 0:
             self._backend.setCurrentIndex(idx)
         self._backend.currentIndexChanged.connect(self._on_backend_changed)
         bg_layout.addRow("Backend:", self._backend)
+
+        # ---- Backend status (CLIP / Ollama availability) ----
+        # The user needs to see which AI backends are actually wired up
+        # so they know why the auto cascade picks the path it does.
+        self._backend_status = QLabel("")
+        self._backend_status.setObjectName("statSmall")
+        self._backend_status.setStyleSheet("color: #888;")
+        self._backend_status.setWordWrap(True)
+        bg_layout.addRow("Status:", self._backend_status)
+        self._refresh_backend_status()
+
+        # ---- Analyzer mode ----
+        # When the cascade falls back to the analyzer (last resort) or
+        # when "heuristic" is picked explicitly, this dropdown picks
+        # WHICH analyzer runs. Default "auto" uses the configured
+        # `organize_mode` from settings.
+        self._mode = QComboBox()
+        mode_labels = {
+            "auto":     "Auto (use configured organize mode)",
+            "lowlevel": "LowLevel CV (no AI, pure heuristics)",
+            "fusion":   "Fusion (CLIP + LowLevel — best quality)",
+            "clip":     "CLIP zero-shot (vision-language)",
+            "ollama":   "Ollama vision LLM (most expensive)",
+        }
+        for k in AI_TAG_MODES:
+            self._mode.addItem(mode_labels.get(k, k), k)
+        self._mode.setCurrentIndex(0)  # auto
+        self._mode.setToolTip(
+            "Analyzer the rename backend uses as the last-resort fallback.\n"
+            "Only used when no AI backend (CLIP/Ollama) is available.\n"
+            "  Auto   - same analyzer configured for organising\n"
+            "  Fusion - CLIP + LowLevel (recommended when CLIP is loaded)\n"
+            "  CLIP   - CLIP zero-shot only (no CV heuristics)\n"
+            "  LowLevel - classical CV only, no AI model\n"
+            "  Ollama - local vision LLM"
+        )
+        bg_layout.addRow("Analyzer fallback:", self._mode)
 
         # Model selector — visible only for backends that need it.
         # When "auto" is picked, the model field is disabled (we use
@@ -282,11 +327,6 @@ class AIRenameDialog(QDialog):
         self._model_refresh_btn.clicked.connect(self._refresh_model_list)
         bg_layout.addRow("", self._model_refresh_btn)
 
-        self._backend_status = QLabel("")
-        self._backend_status.setObjectName("statSmall")
-        self._backend_status.setStyleSheet("color: #888;")
-        self._backend_status.setWordWrap(True)
-        bg_layout.addRow("Status:", self._backend_status)
         l.addWidget(bg)
 
         # ---- Strategy + options ----
@@ -448,19 +488,75 @@ class AIRenameDialog(QDialog):
             self._model_combo.setEnabled(False)
             self._model_refresh_btn.setEnabled(False)
             self._backend_status.setText(
-                "Pure CV heuristics — no AI. Tags come from colour / "
-                "edge / palette analysis. Fastest option, no model needed."
+                "Analyzer pipeline (same as category assignment). "
+                "No AI model — tags come from CV heuristics + content "
+                "detectors (anime/cyberpunk/portrait/...) when their "
+                "signals fire. Best when no CLIP/Ollama is available."
             )
         else:  # auto
             self._model_combo.setEnabled(False)
             self._model_refresh_btn.setEnabled(False)
-            self._backend_status.setText(
-                "Auto: tries Ollama first, falls back to CLIP, then "
-                "heuristics. The configured active model is used for each "
-                "backend. Use the per-backend tabs to switch models."
-            )
+            self._refresh_backend_status()
         self._update_warning()
         self._apply_btn.setEnabled(self._has_preview)
+
+    def _refresh_backend_status(self):
+        """Probe CLIP and Ollama availability for the auto cascade."""
+        if self._backend.currentData() != "auto":
+            return
+        # CLIP availability probe (no model load — just check the engine).
+        clip_ok = False
+        clip_msg = ""
+        try:
+            from ..clip_client import get_engine
+            engine = get_engine()
+            clip_ok = bool(engine.available)
+        except Exception as e:
+            clip_msg = f" ({e})"
+        # Ollama availability probe.
+        ollama_ok = False
+        try:
+            from .. import settings as _s
+            from ..ollama_client import OllamaClient
+            cfg = _s.load_settings()
+            client = OllamaClient(
+                base_url=cfg.get("ollama_url", "http://localhost:11434"),
+                timeout=2,
+            )
+            try:
+                ollama_ok = bool(client.list_models())
+            finally:
+                client.close()
+        except Exception:
+            ollama_ok = False
+
+        cascade = []
+        if clip_ok:
+            cascade.append("CLIP")
+        if ollama_ok:
+            cascade.append("Ollama")
+        cascade.append("Analyzer")
+        chain = " → ".join(cascade)
+        if clip_ok:
+            self._backend_status.setText(
+                f"Auto cascade: {chain}. "
+                "CLIP will score each image against the full registry "
+                "and pick the top-K most relevant tags.{oll}".format(
+                    oll=("" if ollama_ok else " Ollama server not reachable.")
+                )
+            )
+        elif ollama_ok:
+            self._backend_status.setText(
+                f"Auto cascade: {chain}. CLIP not loaded — Ollama "
+                "will be used (slower, vision LLM)."
+            )
+        else:
+            self._backend_status.setText(
+                f"Auto cascade: {chain}. No AI backend available — "
+                "will fall back to analyzer content heuristics. "
+                "Install CLIP (`pip install git+https://github.com/openai/CLIP.git`) "
+                "or start Ollama for AI-driven semantic tagging."
+            )
 
     def _on_strategy_changed(self):
         strat = self._strat.currentData()
@@ -573,6 +669,7 @@ class AIRenameDialog(QDialog):
             max_tags=self._max_tags.value(),
             model=model,
             force_reprocess=self._force_reprocess,
+            mode=self._mode.currentData() or "auto",
         )
         self._preview_job.progress.connect(self._on_preview_progress)
         self._preview_job.finished_ok.connect(self._on_preview_done)

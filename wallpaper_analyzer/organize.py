@@ -25,7 +25,8 @@ from . import tags as t
 from .duplicates import (
     load_hash_cache, save_hash_cache,
     find_duplicate_groups,
-    scan_and_hash, find_md5_duplicate_groups,
+    scan_and_hash, scan_and_hash_perceptual,
+    find_md5_duplicate_groups,
 )
 from .quality import laplacian_variance
 from .classify import classify
@@ -591,13 +592,60 @@ def organize(mode: str = "lowlevel",
         else:
             print("[DEDUPE-MD5] No exact duplicates found", flush=True)
 
-        # Use the module-level `scan_and_hash` already imported at the top.
-        cache = scan_and_hash(
+        # ---- Perceptual pass (image-content-aware) ----
+        # Catches "same image, different bytes" duplicates (re-encoded,
+        # re-compressed, resized, different container). Uses multi-perceptual
+        # hashes (dHash, pHash, aHash, color hash, RGB histogram) bucketed
+        # via LSH on the 16-bit coarse dHash so we only verify candidates.
+        s_for_dedupe = s
+        perceptual_enabled = bool(s_for_dedupe.get("dedupe_perceptual", True))
+        if perceptual_enabled:
+            _perc_t0 = _time.time()
+            print(
+                f"[DEDUPE-PERC] Computing perceptual hashes for "
+                f"{len(all_files)} files...",
+                flush=True,
+            )
+            _perc_last_save = [0]
+            _perc_last_emit = [0]
+            def _perc_progress(cur, total, fn, st):
+                if progress_callback and (cur - _perc_last_emit[0] >= 25 or cur == total):
+                    try:
+                        progress_callback("progress", cur, total,
+                                          os.path.basename(fn), "dedupe-perceptual")
+                    except Exception:
+                        pass
+                    _perc_last_emit[0] = cur
+                if cur % 50 == 0 or cur == total:
+                    elapsed = _time.time() - _perc_t0
+                    rate = cur / max(elapsed, 0.1)
+                    eta = (total - cur) / max(rate, 0.1)
+                    print(
+                        f"  [{cur}/{total}] {os.path.basename(fn)} "
+                        f"({rate:.0f}/s, ~{eta:.0f}s left)",
+                        flush=True,
+                    )
+                if cur - _perc_last_save[0] >= 200:
+                    save_hash_cache(cache)
+                    _perc_last_save[0] = cur
+            cache = scan_and_hash_perceptual(
+                all_files, cache,
+                progress_callback=_perc_progress,
+                save_every=200,
+                parallel=max(1, parallel),
+            )
+            print(
+                f"[DEDUPE-PERC] Perceptual pass done in "
+                f"{_time.time() - _perc_t0:.1f}s",
+                flush=True,
+            )
+
+        dedupe_min_tier = s_for_dedupe.get("dedupe_min_tier", "reencode")
+        groups = find_duplicate_groups(
             all_files, cache,
-            progress_callback=_dedupe_progress,
-            parallel=max(1, parallel),
+            mode='soft',
+            min_tier=dedupe_min_tier,
         )
-        groups = find_duplicate_groups(all_files, cache, mode='soft')
         save_hash_cache(cache)
         # Separate: duplicates within destination vs cross-directory
         dest_abs = os.path.abspath(dest_dir)

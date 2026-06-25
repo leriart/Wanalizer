@@ -328,13 +328,32 @@ def test_ai_models_redesigned_uses_backend_cards():
 
 
 def test_reorganize_rename_button_text():
-    """Reorganize header should expose Rename + Rename-only controls."""
+    """Reorganize rename flow uses the move+rename QThread + AIRenameDialog.
+
+    The old `btn_rename_only` button was removed: it froze the UI by
+    running AI synchronously. All rename-only now goes through the
+    AIRenameDialog which has a preview-then-apply flow.
+    """
     import inspect
     from wallpaper_analyzer.gui.pages import reorganize
     src = inspect.getsource(reorganize)
-    assert "btn_rename_only" in src
+    # The move flow still uses _RenameJob.
     assert "_RenameJob" in src
-    assert "compute_renames" in src or "build_renames" in src
+    # The AI rename dialog is the only rename entry point now.
+    assert "AIRenameDialog" in src
+    assert "_on_ai_rename" in src
+    # Old buttons / handlers must be gone.
+    assert "btn_rename_only" not in src
+    assert "_on_rename_only" not in src
+    # The non-AI RenameDialog must NOT be imported or used.
+    assert "from ..rename_dialog" not in src
+    # Only AIRenameDialog (the AI version) should remain. Use a
+    # boundary-aware check so we don't match `AIRenameDialog(`.
+    import re
+    matches = re.findall(r"(?<![A-Za-z])RenameDialog\(", src)
+    assert matches == [], (
+        f"non-AI RenameDialog must not be instantiated; found: {matches}"
+    )
 
 
 def test_ai_tag_backends_constant():
@@ -440,8 +459,14 @@ def test_ai_rename_dialog_no_auto_preview():
     assert dlg._run_btn.isEnabled() is True
 
 
-def test_ai_rename_dialog_default_backend_is_heuristic():
-    """Default backend must be 'heuristic' (safe, no AI)."""
+def test_ai_rename_dialog_default_backend_is_auto():
+    """Default backend must be 'auto' (AI-first cascade: CLIP → Ollama → Analyzer).
+
+    The user explicitly asked for AI-driven tag detection using the
+    full tag registry. The "auto" cascade tries CLIP first (semantic
+    match against the full registry), falls back to Ollama, then to
+    the analyzer heuristics.
+    """
     import sys
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -453,9 +478,10 @@ def test_ai_rename_dialog_default_backend_is_heuristic():
     )
     assert dlg._backend.currentData() == "ollama"
 
-    # Without a caller override we fall back to heuristic.
+    # Without a caller override we default to 'auto' so the AI cascade
+    # runs by default (CLIP / Ollama / Analyzer in that order).
     dlg2 = AIRenameDialog(files=["/tmp/fake.jpg"], category="Anime")
-    assert dlg2._backend.currentData() == "heuristic"
+    assert dlg2._backend.currentData() == "auto"
 
 
 def test_clip_tag_vocab_is_full():
