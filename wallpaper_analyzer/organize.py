@@ -805,6 +805,22 @@ def organize(mode: str = "lowlevel",
                 _learn_tags_for_category(category, {"ollama_all_tags": file_tags})
             except Exception:
                 pass
+        # Persist Ollama tags into the hash cache so the Reorder page's
+        # AIRenamer can read them and produce renames that mirror the
+        # classification log format (ABBR_Category_tag1-tag2-...).
+        if file_tags and mode in ("ollama", "fusion"):
+            try:
+                _cache_path = item.get("fpath") or os.path.join(WALLPAPERS_DIR, fname)
+                _cache_entry = cache.get(_cache_path) or {"sig": "", "md5": ""}
+                _cache_entry["ollama_all_tags"] = list(file_tags)
+                if file_subject:
+                    _cache_entry["ollama_subject"] = file_subject
+                cache[_cache_path] = _cache_entry
+                # Throttle saves so we don't hammer the disk.
+                if total_files <= 50 or stats.get(category, 0) % 25 == 0:
+                    save_hash_cache(cache)
+            except Exception:
+                pass
         if progress_callback:
             try:
                 progress_callback("progress", done, total, fname, category)

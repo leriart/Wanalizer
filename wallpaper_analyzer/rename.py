@@ -353,6 +353,19 @@ def build_renames(
             file_tags = tags_by_file.get(old_path) or []
             comps = _fallback_tags(old_path, file_tags, max_tags=max_tags)
             new_base = "_".join([today] + comps)
+        elif strategy == "ai_classification":
+            # Mirror the AI classification log format in the filename:
+            #   <3-letter-abbr>_<Category>_<tag1-tag2-...>.jpg
+            # e.g. for the log line
+            #   [3/15] 20260623_222915.jpg... [ANI] Anime  (mode=ollama tags=cartoon,anime,female)
+            # the rename produces:
+            #   20260623_222915_ANI_Anime_cartoon-anime-female.jpg
+            cat = sanitize(category or os.path.basename(directory) or "file") or "file"
+            abbr = cat[:3].upper()
+            file_tags = tags_by_file.get(old_path) or []
+            comps = _fallback_tags(old_path, file_tags, max_tags=max_tags)
+            tag_part = "-".join(comps[:max(1, max_tags)]) if comps else "untagged"
+            new_base = f"{abbr}_{cat}_{tag_part}"
         else:
             new_base = base
 
@@ -438,10 +451,14 @@ RENAME_STRATEGIES = [
     ("category_tags", "Category + tags",                   "Cat_tag1_tag2_tag3"),
     ("subject_tags",  "Subject + tags",                   "Subject_tag1_tag2_tag3"),
     ("date_tags",     "Date + tags",                      "2024-12-19_tag1_tag2_tag3"),
+    ("ai_classification",
+                     "AI classification",               "ABBR_Category_tag1-tag2-... (mirrors the [AI] classify log)"),
 ]
 
 # Strategies that need per-file tag info from the caller.
-TAG_BASED_STRATEGIES = {"tags", "category_tags", "subject_tags", "date_tags"}
+TAG_BASED_STRATEGIES = {
+    "tags", "category_tags", "subject_tags", "date_tags", "ai_classification",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -920,8 +937,30 @@ class AIRenamer:
         CLIP legitimately returns colour tokens.
         """
         seen: set = set()
-        ordered: List[str] = []  # preserves priority: CLIP > analyzer > suggest_tags
+        ordered: List[str] = []  # preserves priority: ollama > CLIP > analyzer > suggest_tags
         sources_used: List[str] = []
+
+        # 0. Cached Ollama tags from a prior classification. When the
+        #    user already ran `organize --mode=ollama`, the tags are
+        #    stored in the hash cache as `ollama_all_tags`. We surface
+        #    them with the highest priority so the rename mirrors the
+        #    classification log exactly:
+        #      [AI] mode=ollama tags=cartoon,anime,female
+        #      -> ANI_Anime_cartoon-anime-female.jpg
+        try:
+            from .duplicates import load_hash_cache
+            cache = load_hash_cache()
+            entry = cache.get(path) or {}
+            ollama_tags = entry.get("ollama_all_tags") or entry.get("ollama_tags") or []
+            for t in ollama_tags:
+                tl = str(t).lower().strip()
+                if tl and tl not in seen:
+                    seen.add(tl)
+                    ordered.append(tl)
+            if ollama_tags:
+                sources_used.append("ollama")
+        except Exception:
+            pass
 
         # 1. CLIP semantic match (priority 1).
         try:
