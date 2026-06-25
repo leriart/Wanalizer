@@ -251,6 +251,7 @@ def build_renames(
     tags_by_file: Optional[Dict[str, List[str]]] = None,
     subject_by_file: Optional[Dict[str, Optional[str]]] = None,
     max_tags: int = 3,
+    ai_renamer: Optional["AIRenamer"] = None,
 ) -> List[Tuple[str, str]]:
     """Build a list of (old_path, new_path) for the chosen strategy.
 
@@ -264,6 +265,11 @@ def build_renames(
         tags_by_file: per-file tag lists for tag-based strategies
         subject_by_file: per-file main-subject strings for subject_tags
         max_tags: max number of tags to include in tag-based strategies
+        ai_renamer: optional AIRenamer used by `ai_classification` to
+            enrich Ollama colour tags with CLIP / analyzer content tags.
+            When provided, the strategy ignores `tags_by_file` for
+            per-file detection and lets AIRenamer pick the best signals
+            (Ollama cache → CLIP → analyzer → suggest_tags).
 
     Returns:
         List of (old_path, new_path) tuples (new_path is full path)
@@ -360,9 +366,21 @@ def build_renames(
             #   [3/15] 20260623_222915.jpg... [ANI] Anime  (mode=ollama tags=cartoon,anime,female)
             # the rename produces:
             #   20260623_222915_ANI_Anime_cartoon-anime-female.jpg
+            #
+            # When an AIRenamer is provided we let IT pick the tags
+            # (Ollama cache → CLIP → analyzer → suggest_tags) so the
+            # filename actually uses AI content analysis, not just the
+            # colour tokens the Ollama vision model may have returned.
             cat = sanitize(category or os.path.basename(directory) or "file") or "file"
             abbr = cat[:3].upper()
-            file_tags = tags_by_file.get(old_path) or []
+            if ai_renamer is not None:
+                try:
+                    ai_tags, _ = ai_renamer.detect_tags(old_path, category=category)
+                    file_tags = list(ai_tags)
+                except Exception:
+                    file_tags = list(tags_by_file.get(old_path) or [])
+            else:
+                file_tags = list(tags_by_file.get(old_path) or [])
             comps = _fallback_tags(old_path, file_tags, max_tags=max_tags)
             tag_part = "-".join(comps[:max(1, max_tags)]) if comps else "untagged"
             new_base = f"{abbr}_{cat}_{tag_part}"

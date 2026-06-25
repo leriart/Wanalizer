@@ -877,6 +877,27 @@ def organize(mode: str = "lowlevel",
     if rename_strategy and rename_strategy != "none":
         is_tag_strategy = rename_strategy in TAG_BASED_STRATEGIES
 
+        # Build an AIRenamer once so the ai_classification strategy
+        # can enrich Ollama colour-only tags with content tags from
+        # CLIP / analyzer / suggest_tags. The renamer reads cached
+        # Ollama tags first (so the classification log format is
+        # preserved) and only adds new tags when needed.
+        ai_renamer_for_build = None
+        if rename_strategy == "ai_classification":
+            try:
+                from .rename import AIRenamer
+                # 'auto' backend cascade: CLIP (if installed) →
+                # Ollama → Analyzer. The cached Ollama tags get the
+                # highest priority in _combined_classify.
+                ai_renamer_for_build = AIRenamer(
+                    backend="auto",
+                    mode=mode,  # use the same mode as the classification
+                    max_tags=max(rename_max_tags * 2, 8),
+                    force_reprocess=False,
+                )
+            except Exception:
+                ai_renamer_for_build = None
+
         # Build rename pairs for all classified files
         all_files = []
         cat_by_file = {}
@@ -907,10 +928,18 @@ def organize(mode: str = "lowlevel",
                     kwargs["tags_by_file"] = tags_by_file
                     kwargs["subject_by_file"] = subject_by_file
                     kwargs["max_tags"] = rename_max_tags
+                if ai_renamer_for_build is not None:
+                    kwargs["ai_renamer"] = ai_renamer_for_build
                 pairs = build_renames(files, **kwargs)
                 rename_pairs.extend(pairs)
             except Exception as e:
                 print(f"  [WARN] Rename build failed for {cat}: {e}")
+        # Release the AIRenamer (closes its Ollama HTTP client if any).
+        if ai_renamer_for_build is not None:
+            try:
+                ai_renamer_for_build.close()
+            except Exception:
+                pass
         if rename_pairs:
             tag_msg = f", max {rename_max_tags} tags" if is_tag_strategy else ""
             print(f"Rename: {sum(1 for o, n in rename_pairs if o != n)} files will be renamed ({rename_strategy}{tag_msg})")
