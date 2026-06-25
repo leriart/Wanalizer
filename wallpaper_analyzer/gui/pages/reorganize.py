@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
 from PySide6.QtWidgets import (
-    QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QFrame,
     QSplitter, QListWidget, QListWidgetItem, QMenu, QMessageBox,
     QSlider, QWidget, QCheckBox, QDialog,
     QLineEdit, QComboBox, QProgressBar, QAbstractItemView,
@@ -658,6 +658,8 @@ class ReorganizePage(QWidget):
         l.setSpacing(0)
 
         # ----- Header -----
+        # Two-row header so the action buttons reflow gracefully when the
+        # window is narrow, instead of being clipped on a single crowded row.
         hdr = QFrame()
         hdr.setObjectName("card")
         hdr.setStyleSheet(
@@ -665,8 +667,12 @@ class ReorganizePage(QWidget):
             " border-bottom: 1px solid #1a1a1a; border-radius: 0;"
             " padding: 0px; }"
         )
-        hl = QHBoxLayout(hdr)
-        hl.setContentsMargins(24, 16, 24, 12)
+        hv = QVBoxLayout(hdr)
+        hv.setContentsMargins(24, 16, 24, 12)
+        hv.setSpacing(10)
+
+        # Top row: title + primary actions.
+        hl = QHBoxLayout()
         hl.setSpacing(10)
 
         title_box = QVBoxLayout()
@@ -725,21 +731,42 @@ class ReorganizePage(QWidget):
         self.btn_ai_rename_cat.setEnabled(False)
         hl.addWidget(self.btn_ai_rename_cat)
 
+        hv.addLayout(hl)
+
+        # Bottom row: secondary actions. Kept on a separate row so narrow
+        # windows still show every button without horizontal clipping.
+        h2 = QHBoxLayout()
+        h2.setSpacing(10)
+
+        self.btn_phone = QPushButton("Move to Phone")
+        self.btn_phone.setObjectName("ghost")
+        self.btn_phone.setToolTip(
+            "Move vertical and square images to the 'Phone' category. "
+            "Files keep their original name prefixed with their source "
+            "category (e.g. Anime_filename.jpg) so their origin is preserved."
+        )
+        self.btn_phone.clicked.connect(self._on_move_to_phone)
+        self.btn_phone.setEnabled(False)
+        h2.addWidget(self.btn_phone)
+
         self.btn_dupes = QPushButton("Find Duplicates")
         self.btn_dupes.setObjectName("ghost")
         self.btn_dupes.clicked.connect(self._on_find_duplicates)
-        hl.addWidget(self.btn_dupes)
+        h2.addWidget(self.btn_dupes)
 
         self.btn_ref = QPushButton("Refresh")
         self.btn_ref.setObjectName("ghost")
         self.btn_ref.clicked.connect(self._refresh)
-        hl.addWidget(self.btn_ref)
+        h2.addWidget(self.btn_ref)
 
         self.btn_open_dest = QPushButton("Open folder")
         self.btn_open_dest.setObjectName("ghost")
         self.btn_open_dest.setToolTip("Open the destination folder in the system file manager.")
         self.btn_open_dest.clicked.connect(self._open_destination)
-        hl.addWidget(self.btn_open_dest)
+        h2.addWidget(self.btn_open_dest)
+
+        h2.addStretch()
+        hv.addLayout(h2)
 
         l.addWidget(hdr)
 
@@ -755,12 +782,17 @@ class ReorganizePage(QWidget):
         rnl.setContentsMargins(24, 4, 24, 8)
         rnl.setSpacing(6)
 
-        # First row: rename strategy + prefix + max tags.
-        row1 = QHBoxLayout()
-        row1.setSpacing(10)
-        row1.addWidget(QLabel("Strategy:"))
+        # Rename options grid. Using a grid instead of a single horizontal
+        # row lets the controls reflow and stay usable on narrow windows.
+        opts_grid = QGridLayout()
+        opts_grid.setHorizontalSpacing(16)
+        opts_grid.setVerticalSpacing(8)
+        opts_grid.setColumnStretch(6, 1)
+
+        # Row 0: rename strategy + prefix + max tags.
+        opts_grid.addWidget(QLabel("Strategy:"), 0, 0)
         self._rename_strat = QComboBox()
-        self._rename_strat.setMinimumWidth(220)
+        self._rename_strat.setMinimumWidth(180)
         for key, label, desc in RENAME_STRATEGIES:
             self._rename_strat.addItem(f"{label}  —  {desc}", key)
         self._rename_strat.setCurrentIndex(1)  # default to "By category"
@@ -768,7 +800,7 @@ class ReorganizePage(QWidget):
             "How files are named when 'Rename on move' is enabled."
         )
         self._rename_strat.currentIndexChanged.connect(self._on_rename_strat_changed)
-        row1.addWidget(self._rename_strat)
+        opts_grid.addWidget(self._rename_strat, 0, 1)
 
         self._cb_rename_prefix = QCheckBox("Use category as prefix")
         self._cb_rename_prefix.setChecked(True)
@@ -776,9 +808,9 @@ class ReorganizePage(QWidget):
             "For the 'category' strategy: prefix the category name to the "
             "new filename (e.g. Anime_001.jpg)."
         )
-        row1.addWidget(self._cb_rename_prefix)
+        opts_grid.addWidget(self._cb_rename_prefix, 0, 2)
 
-        row1.addWidget(QLabel("Max tags:"))
+        opts_grid.addWidget(QLabel("Max tags:"), 0, 3)
         self._max_tags = QSpinBox()
         self._max_tags.setRange(1, 8)
         self._max_tags.setValue(3)
@@ -787,18 +819,12 @@ class ReorganizePage(QWidget):
             "strategies. More tags = longer filenames."
         )
         self._max_tags.valueChanged.connect(lambda _v: self._refresh_rename_buttons())
-        row1.addWidget(self._max_tags)
+        opts_grid.addWidget(self._max_tags, 0, 4)
 
-        row1.addStretch()
-        rnl.addLayout(row1)
-
-        # Second row: analysis mode + AI options (mirrors Organize page).
-        row2 = QHBoxLayout()
-        row2.setSpacing(10)
-
-        row2.addWidget(QLabel("Analysis mode:"))
+        # Row 1: analysis mode + model picker.
+        opts_grid.addWidget(QLabel("Analysis mode:"), 1, 0)
         self._ai_mode = QComboBox()
-        self._ai_mode.setMinimumWidth(220)
+        self._ai_mode.setMinimumWidth(180)
         self._ai_mode.addItem("Low-Level CV (edges, textures, shapes, HOG)", "lowlevel")
         self._ai_mode.addItem("CLIP (vision-language model)", "clip")
         self._ai_mode.addItem("CLIP + LowLevel (fusion, recommended)", "fusion")
@@ -812,18 +838,18 @@ class ReorganizePage(QWidget):
             "Analysis mode used to detect content tags. Same modes as the Organize page."
         )
         self._ai_mode.currentIndexChanged.connect(self._on_ai_mode_changed)
-        row2.addWidget(self._ai_mode)
+        opts_grid.addWidget(self._ai_mode, 1, 1)
 
         self._ai_mode_desc = QLabel("")
         self._ai_mode_desc.setObjectName("statSmall")
-        row2.addWidget(self._ai_mode_desc, 1)
+        opts_grid.addWidget(self._ai_mode_desc, 1, 2)
 
         # Model picker for CLIP / Ollama.
         self._ai_model_label = QLabel("Model:")
-        row2.addWidget(self._ai_model_label)
+        opts_grid.addWidget(self._ai_model_label, 1, 3)
         self._ai_model = QComboBox()
         self._ai_model.setEditable(True)
-        self._ai_model.setMinimumWidth(140)
+        self._ai_model.setMinimumWidth(120)
         self._ai_model.setToolTip(
             "Specific model to use. Leave on '(configured)' to inherit from settings."
         )
@@ -835,14 +861,14 @@ class ReorganizePage(QWidget):
                   "minicpm-v:8b", "moondream:latest"):
             self._ai_model.addItem(m, m)
         self._ai_model.setCurrentIndex(0)
-        row2.addWidget(self._ai_model)
+        opts_grid.addWidget(self._ai_model, 1, 4)
 
         self._model_refresh_btn = QPushButton("Refresh")
         self._model_refresh_btn.setObjectName("ghost")
         self._model_refresh_btn.clicked.connect(self._refresh_ai_model_list)
-        row2.addWidget(self._model_refresh_btn)
+        opts_grid.addWidget(self._model_refresh_btn, 1, 5)
 
-        # AI Options toggles (mirrors Organize page).
+        # Row 2: AI Options toggles (mirrors Organize page).
         self._ai_opts_frame = QFrame()
         ai_opts_l = QHBoxLayout(self._ai_opts_frame)
         ai_opts_l.setContentsMargins(0, 0, 0, 0)
@@ -866,16 +892,15 @@ class ReorganizePage(QWidget):
             self._classify_method.setCurrentIndex(idx)
         ai_opts_l.addWidget(self._classify_method)
         ai_opts_l.addStretch()
-        row2.addWidget(self._ai_opts_frame)
+        opts_grid.addWidget(self._ai_opts_frame, 2, 0, 1, 6)
 
         self._ai_status = QLabel("")
         self._ai_status.setObjectName("statSmall")
         self._ai_status.setStyleSheet("color: #888;")
         self._ai_status.setWordWrap(False)
-        row2.addWidget(self._ai_status)
+        opts_grid.addWidget(self._ai_status, 2, 6, alignment=Qt.AlignmentFlag.AlignRight)
 
-        row2.addStretch()
-        rnl.addLayout(row2)
+        rnl.addLayout(opts_grid)
 
         self._rename_strategy_hint = QLabel("")
         self._rename_strategy_hint.setObjectName("statSmall")
@@ -886,8 +911,6 @@ class ReorganizePage(QWidget):
         self._on_ai_mode_changed()
         l.addWidget(rn)
 
-        l.addWidget(hdr)
-
         # ----- Body splitter -----
         sp = QSplitter(Qt.Horizontal)
         sp.setHandleWidth(3)
@@ -895,8 +918,7 @@ class ReorganizePage(QWidget):
 
         # Left: categories
         left = QFrame()
-        left.setMinimumWidth(180)
-        left.setMaximumWidth(280)
+        left.setMinimumWidth(160)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(8, 12, 4, 8)
         ll.setSpacing(6)
@@ -936,7 +958,8 @@ class ReorganizePage(QWidget):
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search by file name...")
         self._search.setClearButtonEnabled(True)
-        self._search.setFixedWidth(220)
+        self._search.setMinimumWidth(140)
+        self._search.setMaximumWidth(320)
         self._search.textChanged.connect(self._on_search_changed)
         tb.addWidget(self._search)
 
@@ -955,7 +978,7 @@ class ReorganizePage(QWidget):
         self._zoom = QSlider(Qt.Horizontal)
         self._zoom.setRange(60, 280)
         self._zoom.setValue(140)
-        self._zoom.setFixedWidth(120)
+        self._zoom.setMinimumWidth(80)
         self._zoom.valueChanged.connect(self._on_zoom)
         tb.addWidget(self._zoom)
 
@@ -1006,8 +1029,7 @@ class ReorganizePage(QWidget):
 
         # Right: preview
         right = QFrame()
-        right.setMinimumWidth(260)
-        right.setMaximumWidth(420)
+        right.setMinimumWidth(220)
         rl = QVBoxLayout(right)
         rl.setContentsMargins(4, 12, 12, 8)
         rl.setSpacing(8)
@@ -1019,12 +1041,12 @@ class ReorganizePage(QWidget):
 
         self._prev_frame = QFrame()
         self._prev_frame.setObjectName("card")
-        self._prev_frame.setMinimumHeight(280)
+        self._prev_frame.setMinimumHeight(200)
         pf = QVBoxLayout(self._prev_frame)
         pf.setContentsMargins(12, 12, 12, 12)
         self._prev_label = QLabel("No file selected")
         self._prev_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._prev_label.setMinimumHeight(220)
+        self._prev_label.setMinimumHeight(160)
         self._prev_label.setStyleSheet("color: #666666; font-size: 11pt;")
         pf.addWidget(self._prev_label)
         rl.addWidget(self._prev_frame)
@@ -1700,6 +1722,129 @@ class ReorganizePage(QWidget):
         if moved:
             self.main.append_log(f"[Reorganize] {moved} files -> {target_cat}")
 
+    # ------------------------ PHONE CATEGORY ------------------------
+
+    def _on_move_to_phone(self):
+        """Optional bulk move: vertical/square images -> Phone/.
+
+        The original category is preserved by prefixing it to the filename
+        (e.g. Anime_wallpaper_01.jpg) so the user can still tell what
+        "type" each image is.
+        """
+        candidates = self._collect_phone_candidates()
+        if not candidates:
+            self._status.setText("No vertical/square images to move to Phone")
+            return
+
+        scope = f"'{self._cur_cat}'" if self._cur_cat else "all categories"
+        msg = (
+            f"Move {len(candidates)} vertical/square image(s) from {scope} "
+            f"to the 'Phone' category?\n\n"
+            f"Files will keep their original name prefixed with their source "
+            f"category (e.g. Anime_filename.jpg) so their origin is preserved."
+        )
+        r = QMessageBox.question(
+            self, "Move to Phone", msg,
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if r != QMessageBox.Yes:
+            self._status.setText("Move to Phone cancelled")
+            return
+
+        self._move_candidates_to_phone(candidates)
+
+    def _collect_phone_candidates(self):
+        """Return list of (path, original_category) for vertical/square images.
+
+        Operates on the current scope: if a category is selected, only its
+        files are considered; otherwise all files are scanned.
+        """
+        source = self._all_files
+        candidates = []
+        for rec in source:
+            fname, fp, cat, _mtime, _size, ftype = rec
+            if ftype == "video":
+                continue
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(fp) as _im:
+                    w, h = _im.size
+            except Exception:
+                continue
+            ar = aspect_ratio_class(w, h)
+            if ar in ("vertical", "square"):
+                candidates.append((fp, cat))
+        return candidates
+
+    def _move_candidates_to_phone(self, candidates):
+        """Perform the actual move to Phone/ with category-prefixed names."""
+        dest = s.resolve_dest_dir(s.load_settings())
+        phone_dir = os.path.join(dest, "Phone")
+        os.makedirs(phone_dir, exist_ok=True)
+        # Make Phone discoverable as a regular category.
+        if not os.path.isfile(os.path.join(phone_dir, ".category.json")):
+            try:
+                c.CATEGORIES_DIR = dest
+                c.write_category_config("Phone", {
+                    "name": "Phone",
+                    "tags": ["phone", "mobile", "vertical", "portrait", "square"],
+                    "prompt": "Vertical and square images collected for phone wallpapers.",
+                    "palette_weights": {},
+                })
+            except Exception:
+                pass
+
+        moved = 0
+        skipped = 0
+        moved_paths = set()
+        src_cat_deltas: dict[str, int] = {}
+
+        for fp, orig_cat in candidates:
+            if not fp or not os.path.isfile(fp):
+                skipped += 1
+                continue
+            cur_cat = self._category_for(fp)
+            if cur_cat == "Phone":
+                skipped += 1
+                continue
+            fname = os.path.basename(fp)
+            ext = os.path.splitext(fname)[1]
+            prefix = (orig_cat or "Uncategorized").strip() or "Uncategorized"
+            new_name = f"{prefix}_{fname}"
+            dst = os.path.join(phone_dir, new_name)
+            n = 1
+            while os.path.exists(dst):
+                base = os.path.splitext(new_name)[0]
+                dst = os.path.join(phone_dir, f"{base}_{n}{ext}")
+                n += 1
+            try:
+                shutil.move(fp, dst)
+                self._undo_stack.append((fp, dst))
+                moved_paths.add(fp)
+                src_cat_deltas[cur_cat] = src_cat_deltas.get(cur_cat, 0) + 1
+                moved += 1
+            except Exception as e:
+                QMessageBox.warning(self, "Move failed", f"{fname}: {e}")
+                skipped += 1
+
+        # Refresh sidebar and view so Phone appears and source counts update.
+        self._load_cats()
+        self._populate()
+        self._update_undo_label()
+
+        msg = f"Moved {moved} image{'s' if moved != 1 else ''} to Phone"
+        if skipped:
+            msg += f"  ({skipped} skipped)"
+        self._status.setText(msg)
+        if moved:
+            preserved = ", ".join(sorted(src_cat_deltas.keys())[:5])
+            if len(src_cat_deltas) > 5:
+                preserved += f" (+{len(src_cat_deltas) - 5} more)"
+            self.main.append_log(
+                f"[Reorganize] {moved} vertical/square images -> Phone "
+                f"(from {preserved})"
+            )
+
     def _delete_items(self, paths: list):
         if not paths:
             return
@@ -2110,13 +2255,16 @@ class ReorganizePage(QWidget):
             self._ai_status.setStyleSheet("color: #c95;")
 
     def _refresh_rename_buttons(self):
-        """Enable rename buttons only when there are visible files."""
+        """Enable action buttons only when there are files to operate on."""
         has_files = bool(self._visible or self._all_files)
         self.btn_ai_rename.setEnabled(has_files)
         # The category-wide AI rename is enabled whenever a category is
         # selected — even with an empty visible selection, the user
         # may want to rename every file in the category.
         self.btn_ai_rename_cat.setEnabled(bool(self._cur_cat))
+        # Phone move needs at least one image loaded (vertical/square
+        # candidates are determined when the button is clicked).
+        self.btn_phone.setEnabled(has_files)
 
     def _current_paths_for_rename(self) -> List[str]:
         """Return the path list the user wants to operate on.

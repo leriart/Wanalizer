@@ -165,8 +165,43 @@ def test_reorder_page_can_be_constructed_with_rename_header():
     src = inspect.getsource(reorganize)
     # Required header attributes the user interacts with.
     for attr in ("_ai_mode", "_ai_model", "_ai_model_label",
-                 "_ai_status", "btn_ai_rename", "btn_ai_rename_cat"):
+                 "_ai_status", "btn_ai_rename", "btn_ai_rename_cat",
+                 "btn_phone"):
         assert f"self.{attr}" in src, f"missing {attr} in Reorder page"
     # Removed attributes must NOT be present.
     for removed in ("self.btn_rename_only", "self.btn_rename =", "self._ai_backend"):
         assert removed not in src, f"{removed} should have been removed"
+
+
+# ---------------------------------------------------------------------------
+# Phone category bulk move
+# ---------------------------------------------------------------------------
+
+def test_reorder_has_phone_move_button():
+    """The Reorganize page must expose a 'Move to Phone' button that is
+    wired to the phone-move handler."""
+    with open("wallpaper_analyzer/gui/pages/reorganize.py") as f:
+        src = f.read()
+    assert "btn_phone" in src
+    assert "_on_move_to_phone" in src
+    assert "self.btn_phone.clicked.connect(self._on_move_to_phone)" in src
+
+
+def test_reorder_phone_move_preserves_original_category():
+    """Moving vertical/square images to Phone must keep the original
+    category identifiable — the implementation prefixes the source
+    category to the filename (e.g. Anime_filename.jpg)."""
+    with open("wallpaper_analyzer/gui/pages/reorganize.py") as f:
+        src = f.read()
+    assert "_collect_phone_candidates" in src
+    assert "_move_candidates_to_phone" in src
+    assert "prefix = (orig_cat" in src or "orig_cat" in src
+    assert "Anime_filename.jpg" in src or "original name prefixed" in src
+
+
+def test_reorder_phone_candidates_are_vertical_or_square():
+    """Phone candidates must be filtered to vertical + square aspect ratios."""
+    with open("wallpaper_analyzer/gui/pages/reorganize.py") as f:
+        src = f.read()
+    assert "aspect_ratio_class(w, h)" in src
+    assert 'ar in ("vertical", "square")' in src
