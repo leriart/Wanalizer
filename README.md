@@ -1,15 +1,11 @@
 <div align="center">
 
-<h1>
-  <img src="https://img.shields.io/badge/WANALIZER-ff007c?style=for-the-badge&logo=python&logoColor=white" alt="Wanalizer">
-</h1>
+<h1>WANALIZER</h1>
+
+<p>Intelligent wallpaper organization that runs entirely on your machine.</p>
 
 <p>
   <img src="assets/collage.png" alt="Wanalizer collage preview" width="720">
-</p>
-
-<p>
-  <strong>Intelligent wallpaper organization that runs entirely on your machine.</strong>
 </p>
 
 <p>
